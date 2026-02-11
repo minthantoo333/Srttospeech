@@ -1,7 +1,7 @@
 import logging
 import os
+import re
 import asyncio
-import pysrt
 import edge_tts
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
@@ -9,7 +9,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAct
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 # -------------------------------------------------------------------------
-# 1. CONFIGURATION
+# 1. LOGGING & CONFIG
 # -------------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -20,21 +20,21 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # -------------------------------------------------------------------------
-# 2. VOICE DATABASE
+# 2. VOICE LIST
 # -------------------------------------------------------------------------
 VOICES = {
-    "burmese": {
-        "label": "🇲🇲 Burmese",
-        "voices": {
-            "Male (Thiha)": "my-MM-ThihaNeural",
-            "Female (Nilar)": "my-MM-NilarNeural"
-        }
-    },
     "japanese": {
         "label": "🇯🇵 Japanese",
         "voices": {
             "Female (Nanami)": "ja-JP-NanamiNeural",
             "Male (Keita)": "ja-JP-KeitaNeural"
+        }
+    },
+    "burmese": {
+        "label": "🇲🇲 Burmese",
+        "voices": {
+            "Male (Thiha)": "my-MM-ThihaNeural",
+            "Female (Nilar)": "my-MM-NilarNeural"
         }
     },
     "english": {
@@ -54,7 +54,7 @@ VOICES = {
 }
 
 # -------------------------------------------------------------------------
-# 3. RENDER KEEPER (Prevents sleeping)
+# 3. RENDER KEEPER
 # -------------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -67,72 +67,81 @@ def start_server():
     server.serve_forever()
 
 # -------------------------------------------------------------------------
-# 4. UTILITY FUNCTIONS
+# 4. SAFE TEXT CLEANER (REGEX)
 # -------------------------------------------------------------------------
-async def clean_srt(text):
-    """Removes timestamps from SRT text."""
+def clean_srt_text(text):
+    """
+    Safely removes timestamps (00:00:00 --> 00:00:05) and sequence numbers
+    while preserving Japanese/Burmese characters.
+    """
     try:
-        # Simple parsing: split by double newline
-        blocks = text.strip().split('\n\n')
+        lines = text.splitlines()
         clean_lines = []
-        for block in blocks:
-            lines = block.split('\n')
-            # Usually line 0 is index, line 1 is time, line 2+ is text
-            if len(lines) >= 3 and '-->' in lines[1]:
-                clean_lines.append(" ".join(lines[2:]))
-            else:
-                # Fallback for non-standard SRT
-                clean_lines.append(block)
+        for line in lines:
+            # 1. Remove Sequence Numbers (pure digits)
+            if line.strip().isdigit():
+                continue
+            # 2. Remove Timestamps (contains -->)
+            if '-->' in line:
+                continue
+            # 3. Keep text lines only
+            if line.strip():
+                clean_lines.append(line.strip())
+        
         return " ".join(clean_lines)
-    except:
-        return text
+    except Exception as e:
+        logger.error(f"Clean Error: {e}")
+        return text # Return original if regex fails
 
 # -------------------------------------------------------------------------
-# 5. MESSAGE HANDLERS (Instant Response)
+# 5. HANDLERS
 # -------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Ready!**\nPaste your SRT text or upload a file.")
+    await update.message.reply_text("✅ **Bot is Online!**\nSend me your Japanese or Burmese SRT text.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles both Text messages and File uploads instantly.
-    """
-    msg = update.message
-    
-    # 1. Get the Content
-    if msg.document:
-        status = await msg.reply_text("📂 **Reading file...**")
-        file = await msg.document.get_file()
-        byte_array = await file.download_as_bytearray()
-        text_content = byte_array.decode('utf-8', errors='ignore')
-        await status.delete()
-    else:
-        text_content = msg.text
+    """Handles Text and Files with Error Reporting"""
+    try:
+        msg = update.message
+        
+        # 1. Extract Text
+        if msg.document:
+            status = await msg.reply_text("📂 **Reading file...**")
+            file = await msg.document.get_file()
+            byte_array = await file.download_as_bytearray()
+            text_content = byte_array.decode('utf-8', errors='ignore')
+            await status.delete()
+        elif msg.text:
+            text_content = msg.text
+        else:
+            return # Ignore stickers/gifs
 
-    # 2. Save to User Memory
-    context.user_data['current_text'] = text_content
+        # 2. Save Text to Memory
+        context.user_data['current_text'] = text_content
 
-    # 3. Detect SRT
-    is_srt = "-->" in text_content and "\n" in text_content
-    preview = text_content[:100].replace("\n", " ") + "..."
-    
-    header = "📜 **SRT Detected**" if is_srt else "📝 **Text Detected**"
-    
-    # 4. Create "Generate" Button
-    keyboard = [
-        [InlineKeyboardButton("🎙 Generate Speech Now", callback_data="menu_categories")],
-        [InlineKeyboardButton("🗑 Clear", callback_data="clear")]
-    ]
-    
-    await msg.reply_text(
-        f"{header}\n\n_{preview}_\n\nTap below to convert to audio:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+        # 3. Detect SRT
+        is_srt = "-->" in text_content
+        preview = text_content[:80].replace("\n", " ") + "..."
+        
+        # 4. Create Keyboard
+        keyboard = []
+        for key, info in VOICES.items():
+            keyboard.append([InlineKeyboardButton(info['label'], callback_data=f"cat_{key}")])
+        keyboard.append([InlineKeyboardButton("🗑 Clear", callback_data="clear")])
 
-# -------------------------------------------------------------------------
-# 6. BUTTON HANDLER
-# -------------------------------------------------------------------------
+        header = "📜 **SRT Detected**" if is_srt else "📝 **Text Detected**"
+        
+        await msg.reply_text(
+            f"{header}\n\n_{preview}_\n\n👇 **Select Language to Convert:**",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        # 🚨 ERROR REPORTER: Tells you exactly what went wrong
+        logger.error(f"Handler Error: {e}")
+        await update.message.reply_text(f"❌ **Error:** {str(e)}")
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -140,22 +149,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- CLEAR ---
     if data == "clear":
         context.user_data.pop('current_text', None)
-        await query.message.edit_text("🗑 **Cleared.** Send new text.")
+        await query.message.edit_text("🗑 **Cleared.**")
         return
 
-    # --- SHOW CATEGORIES (Language List) ---
-    if data == "menu_categories":
-        keyboard = []
-        for key, info in VOICES.items():
-            keyboard.append([InlineKeyboardButton(info['label'], callback_data=f"cat_{key}")])
-        
-        await query.message.edit_text(
-            "🗣 **Select Language:**", 
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    # --- SHOW VOICES (Male/Female) ---
+    # --- SHOW VOICES ---
     if data.startswith("cat_"):
         cat_key = data.split("_")[1]
         category = VOICES[cat_key]
@@ -165,12 +162,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(name, callback_data=f"tts_{vid}")])
         
         # Back Button
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_categories")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_main")])
 
         await query.message.edit_text(
             f"🗣 **Select {category['label']} Voice:**", 
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return
+    
+    # --- BACK TO MAIN ---
+    if data == "menu_main":
+        keyboard = []
+        for key, info in VOICES.items():
+            keyboard.append([InlineKeyboardButton(info['label'], callback_data=f"cat_{key}")])
+        keyboard.append([InlineKeyboardButton("🗑 Clear", callback_data="clear")])
+        await query.message.edit_text("👇 **Select Language:**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     # --- GENERATE AUDIO ---
@@ -179,18 +185,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = context.user_data.get('current_text')
 
         if not text:
-            await query.message.edit_text("❌ Text expired. Please send it again.")
+            await query.message.edit_text("❌ Text expired. Send again.")
             return
 
-        await query.message.edit_text("⏳ **Generating Audio...**\n_(This may take a few seconds)_", parse_mode="Markdown")
+        await query.message.edit_text("⏳ **Generating Audio...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
-            # Clean SRT timestamps before speaking
-            if "-->" in text:
-                final_text = await clean_srt(text)
-            else:
-                final_text = text
+            # Clean Text
+            final_text = clean_srt_text(text)
 
             # Generate
             output_file = f"speech_{query.from_user.id}.mp3"
@@ -205,25 +208,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"✅ Voice: {voice_id}"
             )
             
-            # Cleanup
             os.remove(output_file)
-            await query.message.delete() # Remove the "Generating..." message
+            await query.message.delete()
 
         except Exception as e:
-            await query.message.edit_text(f"❌ Error: {str(e)}")
+            await query.message.edit_text(f"❌ Generation Failed: {str(e)}")
 
 # -------------------------------------------------------------------------
-# 7. MAIN EXECUTION
+# 6. MAIN
 # -------------------------------------------------------------------------
 if __name__ == '__main__':
     if not TOKEN:
-        print("❌ Error: TELEGRAM_TOKEN missing.")
+        print("❌ TELEGRAM_TOKEN missing.")
         exit(1)
         
-    # Start Health Server in Background
     Thread(target=start_server, daemon=True).start()
 
-    # Bot Setup
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler('start', start))
