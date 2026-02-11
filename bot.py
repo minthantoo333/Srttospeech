@@ -6,9 +6,8 @@ import edge_tts
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 
-# --- FIXED IMPORTS HERE ---
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction  # <--- This is the fix
+from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 # -------------------------------------------------------------------------
@@ -70,79 +69,69 @@ def start_server():
     server.serve_forever()
 
 # -------------------------------------------------------------------------
-# 4. SAFE TEXT CLEANER (REGEX)
+# 4. SAFE TEXT CLEANER
 # -------------------------------------------------------------------------
 def clean_srt_text(text):
-    """
-    Safely removes timestamps (00:00:00 --> 00:00:05) and sequence numbers
-    while preserving Japanese/Burmese characters.
-    """
+    """Safely removes timestamps and numbers."""
     try:
         lines = text.splitlines()
         clean_lines = []
         for line in lines:
-            # 1. Remove Sequence Numbers (pure digits)
-            if line.strip().isdigit():
-                continue
-            # 2. Remove Timestamps (contains -->)
-            if '-->' in line:
-                continue
-            # 3. Keep text lines only
-            if line.strip():
-                clean_lines.append(line.strip())
-        
+            if line.strip().isdigit(): continue
+            if '-->' in line: continue
+            if line.strip(): clean_lines.append(line.strip())
         return " ".join(clean_lines)
-    except Exception as e:
-        logger.error(f"Clean Error: {e}")
-        return text # Return original if regex fails
+    except:
+        return text
 
 # -------------------------------------------------------------------------
-# 5. HANDLERS
+# 5. HANDLERS (The Append Logic)
 # -------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ **Bot is Online!**\nSend me your Japanese or Burmese SRT text.")
+    # Reset buffer on start
+    context.user_data['buffer'] = ""
+    await update.message.reply_text(
+        "👋 **Long SRT Mode Ready**\n\n"
+        "1. Send your first message.\n"
+        "2. Keep sending parts if it's long.\n"
+        "3. Click 'Done' when finished."
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles Text and Files with Error Reporting"""
-    try:
-        msg = update.message
-        
-        # 1. Extract Text
-        if msg.document:
-            status = await msg.reply_text("📂 **Reading file...**")
-            file = await msg.document.get_file()
-            byte_array = await file.download_as_bytearray()
-            text_content = byte_array.decode('utf-8', errors='ignore')
-            await status.delete()
-        elif msg.text:
-            text_content = msg.text
-        else:
-            return # Ignore stickers/gifs
+    msg = update.message
+    user_id = update.effective_user.id
+    
+    # Initialize buffer if empty
+    if 'buffer' not in context.user_data:
+        context.user_data['buffer'] = ""
 
-        # 2. Save Text to Memory
-        context.user_data['current_text'] = text_content
+    # Get New Content
+    new_text = ""
+    if msg.document:
+        status = await msg.reply_text("📂 **Reading file...**")
+        file = await msg.document.get_file()
+        byte_array = await file.download_as_bytearray()
+        new_text = byte_array.decode('utf-8', errors='ignore')
+        await status.delete()
+    elif msg.text:
+        new_text = msg.text
 
-        # 3. Detect SRT
-        is_srt = "-->" in text_content
-        preview = text_content[:80].replace("\n", " ") + "..."
-        
-        # 4. Create Keyboard
-        keyboard = []
-        for key, info in VOICES.items():
-            keyboard.append([InlineKeyboardButton(info['label'], callback_data=f"cat_{key}")])
-        keyboard.append([InlineKeyboardButton("🗑 Clear", callback_data="clear")])
-
-        header = "📜 **SRT Detected**" if is_srt else "📝 **Text Detected**"
-        
-        await msg.reply_text(
-            f"{header}\n\n_{preview}_\n\n👇 **Select Language to Convert:**",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        logger.error(f"Handler Error: {e}")
-        await update.message.reply_text(f"❌ **Error:** {str(e)}")
+    # Append to Buffer
+    # Add a newline to ensure smooth joining if Telegram split mid-line
+    context.user_data['buffer'] += "\n" + new_text
+    
+    current_len = len(context.user_data['buffer'])
+    
+    # Send "Part Received" Menu
+    keyboard = [
+        [InlineKeyboardButton("✅ Done / Convert", callback_data="menu_categories")],
+        [InlineKeyboardButton("🗑 Clear All", callback_data="clear")]
+    ]
+    
+    await msg.reply_text(
+        f"📥 **Part Received**\nTotal Length: {current_len} chars\n\n👇 **Send next part OR Click Done:**",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -150,73 +139,68 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # --- CLEAR ---
     if data == "clear":
-        context.user_data.pop('current_text', None)
-        await query.message.edit_text("🗑 **Cleared.**")
+        context.user_data['buffer'] = ""
+        await query.message.edit_text("🗑 **Buffer Cleared.** Start over.")
+        return
+
+    # --- SHOW CATEGORIES ---
+    if data == "menu_categories":
+        if not context.user_data.get('buffer'):
+            await query.message.edit_text("❌ Buffer empty.")
+            return
+
+        keyboard = []
+        for key, info in VOICES.items():
+            keyboard.append([InlineKeyboardButton(info['label'], callback_data=f"cat_{key}")])
+        
+        await query.message.edit_text("🗣 **Select Language:**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     # --- SHOW VOICES ---
     if data.startswith("cat_"):
         cat_key = data.split("_")[1]
         category = VOICES[cat_key]
-        
         keyboard = []
         for name, vid in category['voices'].items():
             keyboard.append([InlineKeyboardButton(name, callback_data=f"tts_{vid}")])
-        
-        # Back Button
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_main")])
-
-        await query.message.edit_text(
-            f"🗣 **Select {category['label']} Voice:**", 
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    # --- BACK TO MAIN ---
-    if data == "menu_main":
-        keyboard = []
-        for key, info in VOICES.items():
-            keyboard.append([InlineKeyboardButton(info['label'], callback_data=f"cat_{key}")])
-        keyboard.append([InlineKeyboardButton("🗑 Clear", callback_data="clear")])
-        await query.message.edit_text("👇 **Select Language:**", reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_categories")])
+        await query.message.edit_text(f"🗣 **Select {category['label']} Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     # --- GENERATE AUDIO ---
     if data.startswith("tts_"):
         voice_id = data.split("_")[1]
-        text = context.user_data.get('current_text')
+        full_text = context.user_data.get('buffer', "")
 
-        if not text:
-            await query.message.edit_text("❌ Text expired. Send again.")
+        if not full_text:
+            await query.message.edit_text("❌ Text expired.")
             return
 
-        await query.message.edit_text("⏳ **Generating Audio...**")
-        
-        # --- FIXED CHAT ACTION ---
+        await query.message.edit_text("⏳ **Merging & Generating...**")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
-            # Clean Text
-            final_text = clean_srt_text(text)
-
-            # Generate
+            final_text = clean_srt_text(full_text)
+            
+            # Use temp filename based on user ID
             output_file = f"speech_{query.from_user.id}.mp3"
             communicate = edge_tts.Communicate(final_text, voice_id)
             await communicate.save(output_file)
 
-            # Send
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=open(output_file, 'rb'),
-                title="Generated Speech",
+                title="Full Audio",
                 caption=f"✅ Voice: {voice_id}"
             )
             
             os.remove(output_file)
             await query.message.delete()
+            # Clear buffer after success
+            context.user_data['buffer'] = "" 
 
         except Exception as e:
-            await query.message.edit_text(f"❌ Generation Failed: {str(e)}")
+            await query.message.edit_text(f"❌ Error: {str(e)}")
 
 # -------------------------------------------------------------------------
 # 6. MAIN
