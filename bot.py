@@ -5,7 +5,10 @@ import asyncio
 import edge_tts
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAction
+
+# --- FIXED IMPORTS HERE ---
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction  # <--- This is the fix
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 # -------------------------------------------------------------------------
@@ -138,7 +141,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        # 🚨 ERROR REPORTER: Tells you exactly what went wrong
         logger.error(f"Handler Error: {e}")
         await update.message.reply_text(f"❌ **Error:** {str(e)}")
 
@@ -189,6 +191,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await query.message.edit_text("⏳ **Generating Audio...**")
+        
+        # --- FIXED CHAT ACTION ---
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
 
         try:
