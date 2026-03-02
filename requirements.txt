@@ -1,9 +1,5 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-pysrt
+python-telegram-bot
 pydub
+pysrt
 edge-tts
-python-telegram-bot>=20.0
-google-genai
-faster-whisper
-yt-dlp
+aiohttp
