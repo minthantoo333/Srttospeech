@@ -264,13 +264,11 @@ async def health_check(request):
 async def run_server():
     app = web.Application()
     app.router.add_get('/', health_check)
-    app.router.add_head('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     print(f"🌐 Uptime Web Server running on port {PORT}")
-
 
 # --- 🚀 MAIN LOOP ---
 async def main():
