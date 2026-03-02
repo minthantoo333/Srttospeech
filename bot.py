@@ -3,6 +3,7 @@ import glob
 import asyncio
 import pysrt
 import re 
+from aiohttp import web # Added for Uptime web server
 
 # Audio Processing
 from pydub import AudioSegment, effects
@@ -15,6 +16,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, Comma
 
 # --- ⚙️ CONFIGURATION ---
 TG_TOKEN = os.getenv("TG_TOKEN")
+PORT = int(os.environ.get("PORT", 8080)) # Port for Render/UptimeRobot
 
 if not TG_TOKEN:
     print("❌ ERROR: TG_TOKEN is missing! Set it in your environment variables.")
@@ -22,6 +24,8 @@ if not TG_TOKEN:
 
 # --- 🗣️ VOICE LIBRARY ---
 VOICE_LIB = {
+    "🇯🇵 Japanese (Female)": "ja-JP-NanamiNeural",
+    "🇯🇵 Japanese (Male)": "ja-JP-KeitaNeural",
     "🇲🇲 Burmese (Male)": "my-MM-ThihaNeural",
     "🇲🇲 Burmese (Female)": "my-MM-NularNeural",
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
@@ -42,7 +46,7 @@ user_prefs = {}
 def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
-            "dub_voice": "my-MM-ThihaNeural", 
+            "dub_voice": "ja-JP-NanamiNeural", # Changed default to JP for testing 
         }
     return user_prefs[user_id]
 
@@ -66,8 +70,7 @@ def wipe_user_data(user_id):
 
 # --- 🔊 AUDIO POST-PROCESSING ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
-    """Trims silence from the beginning and end of an audio segment."""
-    if len(audio_segment) < 100:  # Skip if too short
+    if len(audio_segment) < 100:  
         return audio_segment
         
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
@@ -78,7 +81,6 @@ def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     return trimmed
 
 def make_audio_crisp(audio_segment):
-    """Applies filters to make voice sound sharper and clearer."""
     clean = audio_segment.high_pass_filter(150)
     return effects.normalize(clean)
 
@@ -90,7 +92,7 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
         final_audio = AudioSegment.empty()
         current_timeline_ms = 0
         
-        BASE_RATE_VAL = 10 # +10%
+        BASE_RATE_VAL = 10 
         PITCH_VAL = "-2Hz"
 
         for i, sub in enumerate(subs):
@@ -101,7 +103,6 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            # Wait for start time (Sync check)
             if start_ms > current_timeline_ms:
                 gap = start_ms - current_timeline_ms
                 if gap > 100:
@@ -110,20 +111,17 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
 
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
-            # Generate TTS
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
 
-            # Fix duration if too long
             current_len = len(segment)
             if current_len > allowed_duration_ms:
                 ratio = current_len / allowed_duration_ms
                 extra_speed_needed = (ratio - 1) * 100
                 new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5)
-                
                 if new_rate > 50: new_rate = 50
                 
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
@@ -231,7 +229,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text
     p = get_paths(user_id)
 
-    # SRT DETECTION (For Direct Pasting)
     if re.search(r'\d{2}:\d{2}:\d{2},\d{3} -->', text):
         file_mode = 'a'
         if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n'):
@@ -258,21 +255,47 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await msg.reply_text("❌ Please send an `.srt` subtitle file.")
 
+
+# --- 🌐 UPTIME WEB SERVER ---
+async def health_check(request):
+    """Responds to GET and HEAD requests to keep Render/UptimeRobot happy"""
+    return web.Response(text="Bot is running!", status=200)
+
+async def run_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_head('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"🌐 Uptime Web Server running on port {PORT}")
+
+
+# --- 🚀 MAIN LOOP ---
+async def main():
+    print("🚀 Initializing SRT Dubbing Bot...")
+    
+    # Initialize Telegram Bot
+    bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("voices", voices_command))
+    bot_app.add_handler(CommandHandler("dub", dub_command))
+    bot_app.add_handler(CommandHandler("clearall", clearall_command))
+    bot_app.add_handler(CallbackQueryHandler(callback_handler))
+    bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
+    bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+    
+    # Start bot and server simultaneously
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
+    
+    await run_server()
+    
+    # Keep the asyncio loop running infinitely
+    stop_event = asyncio.Event()
+    await stop_event.wait()
+
 if __name__ == '__main__':
-    print("🚀 SRT Dubbing Bot Running...")
-    app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("voices", voices_command))
-    app.add_handler(CommandHandler("dub", dub_command))
-    app.add_handler(CommandHandler("clearall", clearall_command))
-    
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # Handle direct text messages (pasting SRT code)
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
-    
-    # Only handle Documents (for .srt uploads)
-    app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
-    
-    app.run_polling()
+    asyncio.run(main())
