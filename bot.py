@@ -27,7 +27,7 @@ VOICE_LIB = {
     "🇯🇵 Japanese (Female)": "ja-JP-NanamiNeural",
     "🇯🇵 Japanese (Male)": "ja-JP-KeitaNeural",
     "🇲🇲 Burmese (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Burmese (Female)": "my-MM-NularNeural",
+    "🇲🇲 Burmese (Female)": "my-MM-NilarNeural",
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural",
     "🇺🇸 Brian (Male)": "en-US-BrianNeural",
