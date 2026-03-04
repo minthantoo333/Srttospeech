@@ -27,7 +27,7 @@ VOICE_LIB = {
     "🇯🇵 Japanese (Female)": "ja-JP-NanamiNeural",
     "🇯🇵 Japanese (Male)": "ja-JP-KeitaNeural",
     "🇲🇲 Burmese (Male)": "my-MM-ThihaNeural",
-    "🇲🇲 Burmese (Female)": "my-MM-NilarNeural", # <--- Fixed Typo
+    "🇲🇲 Burmese (Female)": "my-MM-NilarNeural", 
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural",
     "🇺🇸 Brian (Male)": "en-US-BrianNeural",
@@ -47,7 +47,7 @@ user_prefs = {}
 def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
-            "dub_voice": "ja-JP-NanamiNeural", # Changed default to JP for testing 
+            "dub_voice": "ja-JP-NanamiNeural", 
         }
     return user_prefs[user_id]
 
@@ -90,8 +90,12 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
     print(f"🎬 Starting Dubbing for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
-        final_audio = AudioSegment.empty()
-        current_timeline_ms = 0
+        if not subs:
+            return False, "SRT file is empty."
+
+        # Create a silent master canvas based on the last subtitle's end time + a 5-second buffer
+        last_sub_end_ms = (subs[-1].end.hours * 3600 + subs[-1].end.minutes * 60 + subs[-1].end.seconds) * 1000 + subs[-1].end.milliseconds
+        final_audio = AudioSegment.silent(duration=last_sub_end_ms + 5000) 
         
         BASE_RATE_VAL = 10 
         PITCH_VAL = "-2Hz"
@@ -104,20 +108,16 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             text = sub.text.replace("\n", " ").strip()
             if not text: continue 
 
-            if start_ms > current_timeline_ms:
-                gap = start_ms - current_timeline_ms
-                if gap > 100:
-                    final_audio += AudioSegment.silent(duration=gap)
-                    current_timeline_ms += gap
-
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
+            # 1. Generate audio
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
             segment = AudioSegment.from_file(temp_filename)
             segment = trim_silence(segment)
 
+            # 2. Speed up if necessary to minimize aggressive overlaps
             current_len = len(segment)
             if current_len > allowed_duration_ms:
                 ratio = current_len / allowed_duration_ms
@@ -132,12 +132,20 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
                 segment = trim_silence(segment)
 
             segment = make_audio_crisp(segment)
-            final_audio += segment
-            current_timeline_ms += len(segment)
+            
+            # 3. Dynamic Canvas Extension (if the audio runs past our canvas buffer)
+            if start_ms + len(segment) > len(final_audio):
+                final_audio += AudioSegment.silent(duration=(start_ms + len(segment) - len(final_audio) + 2000))
+            
+            # 4. Overlay at the exact SRT start timestamp
+            final_audio = final_audio.overlay(segment, position=start_ms)
             
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
-        final_audio.export(output_path, format="mp3")
+        # Optional: Trim the excess silence from the end of the final master canvas
+        final_audio = trim_silence(final_audio)
+        
+        final_audio.export(output_path, format="mp3", bitrate="192k")
         clean_temp(user_id)
         return True, None
 
