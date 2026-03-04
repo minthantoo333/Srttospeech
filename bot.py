@@ -143,7 +143,7 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
             if os.path.exists(temp_filename): os.remove(temp_filename)
 
         # Optional: Trim the excess silence from the end of the final master canvas
-        final_audio = trim_silence(final_audio)
+        segment = trim_silence(segment)
         
         final_audio.export(output_path, format="mp3", bitrate="192k")
         clean_temp(user_id)
