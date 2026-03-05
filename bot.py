@@ -3,7 +3,7 @@ import glob
 import asyncio
 import pysrt
 import re 
-from aiohttp import web # Added for Uptime web server
+from aiohttp import web
 
 # Audio Processing
 from pydub import AudioSegment, effects
@@ -16,13 +16,13 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, Comma
 
 # --- ⚙️ CONFIGURATION ---
 TG_TOKEN = os.getenv("TG_TOKEN")
-PORT = int(os.environ.get("PORT", 8080)) # Port for Render/UptimeRobot
+PORT = int(os.environ.get("PORT", 8080))
 
 if not TG_TOKEN:
     print("❌ ERROR: TG_TOKEN is missing! Set it in your environment variables.")
     exit()
 
-# --- 🗣️ VOICE LIBRARY ---
+# --- 🗣️ VOICE & SPEED LIBRARY ---
 VOICE_LIB = {
     "🇯🇵 Japanese (Female)": "ja-JP-NanamiNeural",
     "🇯🇵 Japanese (Male)": "ja-JP-KeitaNeural",
@@ -34,20 +34,25 @@ VOICE_LIB = {
     "🇺🇸 Andrew (Male)": "en-US-AndrewNeural"
 }
 
+SPEED_LIB = {
+    "1.0x (Normal)": 1.0,
+    "0.9x (Slightly Slow)": 0.9,
+    "0.8x (Slow)": 0.8,
+    "0.7x (Very Slow)": 0.7
+}
 
-# Folders
 BASE_FOLDERS = ["downloads", "temp"]
 for f in BASE_FOLDERS:
     os.makedirs(f, exist_ok=True)
 
-# User Data
 user_prefs = {}
 
 # --- 🛠️ HELPER FUNCTIONS ---
 def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
-            "dub_voice": "ja-JP-NanamiNeural", 
+            "dub_voice": "my-MM-NilarNeural", 
+            "video_speed": 1.0 # Default speed is normal
         }
     return user_prefs[user_id]
 
@@ -69,40 +74,64 @@ def wipe_user_data(user_id):
     clean_temp(user_id)
     if user_id in user_prefs: del user_prefs[user_id]
 
-# --- 🔊 AUDIO POST-PROCESSING ---
+# --- 🔊 AUDIO POST-PROCESSING (Sync functions to run in threads) ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100:  
         return audio_segment
-        
     start_trim = detect_leading_silence(audio_segment, silence_threshold=silence_thresh, chunk_size=chunk_size)
     end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_thresh, chunk_size=chunk_size)
-    
-    duration = len(audio_segment)
-    trimmed = audio_segment[start_trim:duration-end_trim]
-    return trimmed
+    return audio_segment[start_trim:len(audio_segment)-end_trim]
 
 def make_audio_crisp(audio_segment):
     clean = audio_segment.high_pass_filter(150)
     return effects.normalize(clean)
 
+def process_length_and_trim(file_path):
+    """Loads, trims, overwrites, and returns length of audio (Runs in thread to prevent blocking)"""
+    seg = AudioSegment.from_file(file_path)
+    seg = trim_silence(seg)
+    seg.export(file_path, format="mp3")
+    return len(seg)
+
+def compose_final_audio(chunks_data, duration_ms, output_path):
+    """Stitches all generated chunks onto a silent canvas (Runs in thread)"""
+    final_audio = AudioSegment.silent(duration=duration_ms + 5000) 
+    
+    for start_ms, file_path in chunks_data:
+        try:
+            segment = AudioSegment.from_file(file_path)
+            segment = make_audio_crisp(segment)
+            
+            # Dynamic Canvas Extension
+            if start_ms + len(segment) > len(final_audio):
+                final_audio += AudioSegment.silent(duration=(start_ms + len(segment) - len(final_audio) + 2000))
+            
+            final_audio = final_audio.overlay(segment, position=start_ms)
+        except Exception as e:
+            print(f"Error processing chunk {file_path}: {e}")
+            
+    final_audio = trim_silence(final_audio)
+    final_audio.export(output_path, format="mp3", bitrate="192k")
+
 # --- 🎬 DUBBING ENGINE ---
-async def generate_dubbing(user_id, srt_path, output_path, voice):
-    print(f"🎬 Starting Dubbing for {user_id}...")
+async def generate_dubbing(user_id, srt_path, output_path, voice, target_speed):
+    print(f"🎬 Starting Dubbing for {user_id} at {target_speed}x speed...")
     try:
         subs = pysrt.open(srt_path)
         if not subs:
             return False, "SRT file is empty."
 
-        # Create a silent master canvas based on the last subtitle's end time + a 5-second buffer
-        last_sub_end_ms = (subs[-1].end.hours * 3600 + subs[-1].end.minutes * 60 + subs[-1].end.seconds) * 1000 + subs[-1].end.milliseconds
-        final_audio = AudioSegment.silent(duration=last_sub_end_ms + 5000) 
+        time_multiplier = 1.0 / target_speed
+        last_sub_end_ms = int(subs[-1].end.ordinal * time_multiplier)
         
+        chunks_data = [] # Stores (start_ms, temp_file_path)
         BASE_RATE_VAL = 10 
         PITCH_VAL = "-2Hz"
 
         for i, sub in enumerate(subs):
-            start_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000 + sub.start.milliseconds
-            end_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000 + sub.end.milliseconds
+            # Calculate stretched timestamps dynamically
+            start_ms = int(sub.start.ordinal * time_multiplier)
+            end_ms = int(sub.end.ordinal * time_multiplier)
             allowed_duration_ms = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
@@ -110,46 +139,34 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
 
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
-            # 1. Generate audio
+            # 1. Generate normal TTS audio
             communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
-            segment = AudioSegment.from_file(temp_filename)
-            segment = trim_silence(segment)
+            # 2. Check length in background thread
+            current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
 
-            # 2. Speed up if necessary to minimize aggressive overlaps
-            current_len = len(segment)
+            # 3. Speed up if still too long for the new stretched window
             if current_len > allowed_duration_ms:
                 ratio = current_len / allowed_duration_ms
                 extra_speed_needed = (ratio - 1) * 100
                 new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5)
-                if new_rate > 50: new_rate = 50
+                if new_rate > 70: new_rate = 70 # Increased cap to 70 for tight squeezes
                 
                 communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
                 await communicate.save(temp_filename)
-                
-                segment = AudioSegment.from_file(temp_filename)
-                segment = trim_silence(segment)
+                await asyncio.to_thread(process_length_and_trim, temp_filename)
 
-            segment = make_audio_crisp(segment)
-            
-            # 3. Dynamic Canvas Extension (if the audio runs past our canvas buffer)
-            if start_ms + len(segment) > len(final_audio):
-                final_audio += AudioSegment.silent(duration=(start_ms + len(segment) - len(final_audio) + 2000))
-            
-            # 4. Overlay at the exact SRT start timestamp
-            final_audio = final_audio.overlay(segment, position=start_ms)
-            
-            if os.path.exists(temp_filename): os.remove(temp_filename)
+            chunks_data.append((start_ms, temp_filename))
 
-        # Optional: Trim the excess silence from the end of the final master canvas
-        segment = trim_silence(segment)
+        # 4. Offload the heavy audio stitching to a background thread
+        await asyncio.to_thread(compose_final_audio, chunks_data, last_sub_end_ms, output_path)
         
-        final_audio.export(output_path, format="mp3", bitrate="192k")
         clean_temp(user_id)
         return True, None
 
     except Exception as e:
+        clean_temp(user_id)
         return False, str(e)
 
 # --- 🤖 HANDLERS ---
@@ -157,6 +174,7 @@ async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand("start", "🏠 Home"),
         BotCommand("voices", "🗣️ Change Voice"),
+        BotCommand("speed", "⏱️ Video Speed"),
         BotCommand("dub", "🎬 Dub Audio"),
         BotCommand("clearall", "🧹 Clear Data")
     ])
@@ -166,8 +184,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(user_id)
     
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
+    speed_val = state['video_speed']
+    
     keyboard = [
-        [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")]
+        [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")],
+        [InlineKeyboardButton(f"⏱️ Target Video Speed: {speed_val}x", callback_data="cmd_speed")]
     ]
     await update.message.reply_text("👋 **SRT Dubbing Studio**\nSend me an `.srt` file or paste SRT text to get started.", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -183,6 +204,19 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = update.message if update.message else update.callback_query.message
     await msg.reply_text("🗣️ **Select Narrator Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    row = []
+    for name, val in SPEED_LIB.items():
+        row.append(InlineKeyboardButton(name, callback_data=f"set_speed_{val}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row: keyboard.append(row)
+    
+    msg = update.message if update.message else update.callback_query.message
+    await msg.reply_text("⏱️ **Select your target Video Speed:**\n(Timestamps will stretch automatically to fit the slower video)", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wipe_user_data(update.effective_user.id)
@@ -202,13 +236,14 @@ async def perform_dubbing(update, context):
         return
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
-    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name})... This might take a minute.**")
+    speed_val = state['video_speed']
+    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name} | {speed_val}x Speed)...**\nPlease wait, this is processed in the background.")
     
-    success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
+    success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'], speed_val)
     
     if success:
         await status.delete()
-        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=f"✅ **Dubbed successfully by {voice_name}!**")
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=f"✅ **Dubbed successfully!**\n🗣️ Voice: {voice_name}\n⏱️ Optimized for: {speed_val}x Video Speed")
     else:
         await status.edit_text(f"❌ Dubbing Failed: {error}")
 
@@ -222,11 +257,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await voices_command(update, context)
         await query.answer()
 
+    elif data == "cmd_speed":
+        await speed_command(update, context)
+        await query.answer()
+
     elif data.startswith("set_voice_"):
         new_voice = data.replace("set_voice_", "")
         state['dub_voice'] = new_voice
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom Voice")
         await query.message.edit_text(f"✅ Voice set to: **{v_name}**")
+
+    elif data.startswith("set_speed_"):
+        new_speed = float(data.replace("set_speed_", ""))
+        state['video_speed'] = new_speed
+        await query.message.edit_text(f"✅ Target Video Speed set to: **{new_speed}x**")
 
     elif data == "trigger_dub":
         await perform_dubbing(update, context)
@@ -264,11 +308,9 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await msg.reply_text("❌ Please send an `.srt` subtitle file.")
 
-
 # --- 🌐 UPTIME WEB SERVER ---
 async def health_check(request):
-    """Responds to GET and HEAD requests to keep Render/UptimeRobot happy"""
-    return web.Response(text="Bot is running!", status=200)
+    return web.Response(text="Bot is running smoothly!", status=200)
 
 async def run_server():
     app = web.Application()
@@ -283,24 +325,22 @@ async def run_server():
 async def main():
     print("🚀 Initializing SRT Dubbing Bot...")
     
-    # Initialize Telegram Bot
     bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("voices", voices_command))
+    bot_app.add_handler(CommandHandler("speed", speed_command))
     bot_app.add_handler(CommandHandler("dub", dub_command))
     bot_app.add_handler(CommandHandler("clearall", clearall_command))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
     
-    # Start bot and server simultaneously
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
     
     await run_server()
     
-    # Keep the asyncio loop running infinitely
     stop_event = asyncio.Event()
     await stop_event.wait()
 
