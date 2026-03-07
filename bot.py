@@ -513,14 +513,23 @@ async def run_server():
 # 🚀 BUG FIX: Cleaned up run_polling to modern PTB v20+ standard
 async def main():
     bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
+    
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("clearall", clearall_command))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
     
+    # ChatGPT ဖျက်ခိုင်းခဲ့တဲ့ မှန်ကန်တဲ့ PTB v20+ Custom Loop အပိုင်းကို ပြန်ထည့်ခြင်း
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
+    
+    # Web Server ကို နောက်ကွယ်မှာ ပြိုင်တူ Run ခြင်း
     asyncio.create_task(run_server())
     
-    await bot_app.run_polling()
+    # Bot ကို မပိတ်သွားအောင် ဆက်ဖွင့်ထားပေးခြင်း
+    await asyncio.Event().wait()
 
-if __name__ == '__main__': asyncio.run(main())
+if __name__ == '__main__': 
+    asyncio.run(main())
