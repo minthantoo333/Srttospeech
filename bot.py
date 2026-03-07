@@ -5,6 +5,7 @@ import pysrt
 import re 
 import time
 import math
+import hashlib
 from aiohttp import web
 
 # Audio Processing
@@ -42,7 +43,6 @@ VOICE_LIB = {
     "🇰🇷 SunHi (Female)": "ko-KR-SunHiNeural"
 }
 
-# 🚀 MULTI-CHARACTER ALIASES (E.g., "nilar: မင်္ဂလာပါ" will use Nilar's voice)
 SPEAKER_ALIASES = {
     "thiha": "my-MM-ThihaNeural",
     "nilar": "my-MM-NilarNeural",
@@ -106,7 +106,7 @@ def get_paths(user_id):
     }
 
 def clean_temp(user_id):
-    for f in glob.glob(f"temp/{user_id}_chunk_*.mp3"):
+    for f in glob.glob(f"temp/{user_id}_*.mp3"):
         try: os.remove(f)
         except: pass
 
@@ -118,7 +118,6 @@ def wipe_user_data(user_id):
     if user_id in user_prefs: del user_prefs[user_id]
 
 def parse_speaker(text, default_voice):
-    """Detects 'Name: Text' format and returns the matching voice and clean text."""
     match = re.match(r"^([a-zA-Z0-9]+)\s*:\s*(.*)", text)
     if match:
         speaker_name = match.group(1).lower()
@@ -126,6 +125,10 @@ def parse_speaker(text, default_voice):
         if speaker_name in SPEAKER_ALIASES:
             return SPEAKER_ALIASES[speaker_name], clean_text
     return default_voice, text
+
+def get_audio_hash(text, voice, rate):
+    hash_str = f"{text}|{voice}|{rate}"
+    return hashlib.md5(hash_str.encode()).hexdigest()
 
 # --- 🔊 AUDIO POST-PROCESSING ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
@@ -158,7 +161,7 @@ def compose_final_audio(chunks_data, duration_ms, output_path):
             print(f"Error chunk {file_path}: {e}")
     final_audio.export(output_path, format="mp3", bitrate="192k")
 
-# --- ⚡ PHASE 1: MEASURE BASE AUDIO ---
+# --- ⚡ PHASE 1: MEASURE BASE AUDIO (WITH CACHE) ---
 async def measure_base_chunk(chunk, user_id, base_rate_str, semaphore, progress_cb):
     async with semaphore:
         idx = chunk["index"]
@@ -168,7 +171,14 @@ async def measure_base_chunk(chunk, user_id, base_rate_str, semaphore, progress_
             await progress_cb()
             return {"index": idx, "len": 0, "path": None, "text": "", "voice": voice}
             
-        path = f"temp/{user_id}_chunk_{idx}_base.mp3"
+        audio_hash = get_audio_hash(text, voice, base_rate_str)
+        path = f"temp/{user_id}_{audio_hash}.mp3"
+        
+        if os.path.exists(path):
+            length = await asyncio.to_thread(process_length_and_trim, path)
+            await progress_cb()
+            return {"index": idx, "len": length, "path": path, "text": text, "voice": voice}
+
         for attempt in range(3):
             try:
                 comm = edge_tts.Communicate(text, voice, rate=base_rate_str, pitch="-2Hz")
@@ -180,7 +190,7 @@ async def measure_base_chunk(chunk, user_id, base_rate_str, semaphore, progress_
                 if attempt == 2: return {"index": idx, "len": 0, "path": None, "text": "", "voice": voice}
                 await asyncio.sleep(1)
 
-# --- ⚡ PHASE 2: FINAL PERFECT FIT GENERATION ---
+# --- ⚡ PHASE 2: FINAL PERFECT FIT GENERATION (WITH CACHE) ---
 async def process_final_chunk(chunk, base_res, global_ratio, user_id, base_rate_int, max_fit, semaphore, progress_cb):
     async with semaphore:
         idx = chunk["index"]
@@ -206,8 +216,14 @@ async def process_final_chunk(chunk, base_res, global_ratio, user_id, base_rate_
         new_rate_int = int(base_rate_int + extra_speed + 5) 
         if new_rate_int > max_fit: new_rate_int = max_fit
 
-        final_path = f"temp/{user_id}_chunk_{idx}_final.mp3"
         rate_str = f"+{new_rate_int}%"
+        audio_hash = get_audio_hash(text, voice, rate_str)
+        final_path = f"temp/{user_id}_{audio_hash}.mp3"
+        
+        if os.path.exists(final_path):
+            await progress_cb()
+            return (new_start_ms, final_path)
+
         for attempt in range(3):
             try:
                 comm = edge_tts.Communicate(text, voice, rate=rate_str, pitch="-2Hz")
@@ -248,9 +264,7 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
             gap_duration = next_start_ms - start_ms
             
             raw_text = sub.text.replace("\n", " ").strip()
-            # 🚀 Detect Multi-Character Voice here!
             chunk_voice, clean_text = parse_speaker(raw_text, global_voice)
-            
             chunks_data.append({"index": i, "start": start_ms, "end": end_ms, "gap": gap_duration, "text": clean_text, "voice": chunk_voice})
 
         total_tasks = len(chunks_data) if analyze_only else len(chunks_data) * 2 
@@ -272,16 +286,16 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
                     last_update_time = now
                 except Exception: pass
 
-        # --- PHASE 1 (Always runs) ---
+        # --- PHASE 1 ---
         semaphore = asyncio.Semaphore(5)
         phase_text = "Analyzing Lines" if analyze_only else "Phase 1/2 (Measuring)"
         p1_tasks = [measure_base_chunk(c, user_id, base_rate_str, semaphore, lambda: update_progress(phase_text)) for c in chunks_data]
         p1_results_list = await asyncio.gather(*p1_tasks)
         base_results = {res["index"]: res for res in p1_results_list if res is not None}
 
-        # CALCULATE MATH & FIND BOTTLENECKS
+        # CALCULATE MATH & CATEGORIZE BOTTLENECKS
         max_ratio_needed = 1.0
-        bottleneck_lines = []
+        bottleneck_categories = {} # Dictionary to store lines by speed category
 
         for chunk in chunks_data:
             idx = chunk["index"]
@@ -293,13 +307,21 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
             if base_len > gap:
                 shrink_factor = base_speed_factor / max_speed_factor
                 min_possible_len = base_len * shrink_factor
+                
                 if min_possible_len > gap:
                     ratio = min_possible_len / gap
-                    bottleneck_lines.append(str(idx + 1)) 
                     if ratio > max_ratio_needed:
                         max_ratio_needed = ratio
+                        
+                    # Calculate required speed for this specific line
+                    line_speed = math.floor((1.0 / ratio) * 10) / 10.0
+                    if line_speed < 0.6: line_speed = 0.6
+                    
+                    cat_key = round(line_speed, 1)
+                    if cat_key not in bottleneck_categories:
+                        bottleneck_categories[cat_key] = []
+                    bottleneck_categories[cat_key].append(str(idx + 1))
 
-        # Clean math output
         if target_speed == "auto":
             clean_speed = math.floor((1.0 / max_ratio_needed) * 10) / 10.0
             if clean_speed < 0.6: clean_speed = 0.6
@@ -309,24 +331,28 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
             global_stretch_ratio = 1.0 / float(target_speed)
             final_speed_reported = f"{target_speed}x (Manual)"
 
-        # Set friendly global voice name for caption
         friendly_voice_name = next((k for k, v in VOICE_LIB.items() if v == global_voice), global_voice)
 
-        # --- ANALYZE ONLY RETURN ---
         if analyze_only:
-            clean_temp(user_id) 
             report = f"📊 **ANALYSIS REPORT**\n\n"
-            report += f"⚡ **Calculated Video Speed:** `{final_speed_reported}`\n"
-            if bottleneck_lines:
-                b_str = ", ".join(bottleneck_lines[:15])
-                if len(bottleneck_lines) > 15: b_str += "..."
-                report += f"⚠️ **Bottleneck Lines (Require Stretch):**\n`{b_str}`\n\n"
-                report += f"💡 *Tip: Shorten these specific lines in your SRT, then Analyze again to get closer to 1.0x speed!*"
+            report += f"⚡ **Global Video Speed Needed:** `{final_speed_reported}`\n\n"
+            
+            if bottleneck_categories:
+                report += f"⚠️ **Bottleneck Lines Breakdown:**\n"
+                # Sort descending (e.g., 0.9, 0.8, 0.7, 0.6)
+                for speed_cat in sorted(bottleneck_categories.keys(), reverse=True):
+                    lines = bottleneck_categories[speed_cat]
+                    b_str = ", ".join(lines[:12])
+                    if len(lines) > 12: b_str += "..."
+                    report += f"• Needs `{speed_cat}x`: Lines {b_str}\n"
+                report += f"\n💡 *Tip: Fix the {clean_speed}x lines first to improve overall video speed!*"
             else:
-                report += f"✅ **Perfect Fit!** All lines fit naturally inside the gaps. No timeline stretching is needed."
+                report += f"✅ **Perfect Fit!** All lines fit naturally inside the gaps.\n\n"
+                
+            report += "\n*(Settings cached. Click 'Generate' to create audio instantly!)*"
             return True, None, report, friendly_voice_name
 
-        # --- PHASE 2 (Only for Dubbing) ---
+        # --- PHASE 2 ---
         p2_tasks = []
         for chunk in chunks_data:
             res = base_results.get(chunk["index"])
@@ -337,19 +363,19 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
         last_sub_end_ms = int(subs[-1].end.ordinal * global_stretch_ratio)
         await asyncio.to_thread(compose_final_audio, final_stretched_chunks, last_sub_end_ms, output_path)
         
-        clean_temp(user_id)
-        
-        # Build final caption
         caption = f"✅ **Dubbed successfully!**\n🗣️ Global Voice: {friendly_voice_name}\n⚡ **Speed Applied: {final_speed_reported}**"
-        if bottleneck_lines and target_speed == "auto":
-            b_str = ", ".join(bottleneck_lines[:8])
-            if len(bottleneck_lines) > 8: b_str += "..."
-            caption += f"\n⚠️ Stretch Caused By: {b_str}"
+        
+        if bottleneck_categories and target_speed == "auto":
+            # Just show the absolute worst offenders in the final output to keep it clean
+            worst_speed = min(bottleneck_categories.keys())
+            worst_lines = bottleneck_categories[worst_speed]
+            b_str = ", ".join(worst_lines[:6])
+            if len(worst_lines) > 6: b_str += "..."
+            caption += f"\n⚠️ Pulled down to {worst_speed}x by lines: {b_str}"
             
         return True, None, caption, friendly_voice_name
 
     except Exception as e:
-        clean_temp(user_id)
         return False, str(e), "Error", "Error"
 
 # --- 🤖 HANDLERS ---
@@ -405,7 +431,7 @@ async def speed_command(u, c): await handle_menu(u, c, SPEED_LIB, "set_speed", "
 
 async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wipe_user_data(update.effective_user.id)
-    await update.message.reply_text("🧹 **All temporary files cleared.**")
+    await update.message.reply_text("🧹 **All data and cache cleared.**")
 
 async def perform_action(update, context, analyze_only):
     user_id = update.effective_user.id
@@ -427,7 +453,6 @@ async def perform_action(update, context, analyze_only):
             await status_msg.edit_text(result_text, reply_markup=get_action_keyboard())
         else:
             await status_msg.delete()
-            # 🚀 BUG FIX: Correctly used msg.chat.id here!
             await context.bot.send_audio(chat_id=msg.chat.id, audio=open(p['dub_audio'], "rb"), caption=result_text)
     else:
         await status_msg.edit_text(f"❌ Failed: {error}")
@@ -465,7 +490,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = get_paths(user_id)
 
     if re.search(r'\d{2}:\d{2}:\d{2},\d{3}', text):
-        file_mode = 'w' if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n') else 'a'
+        is_new_file = re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n')
+        if is_new_file:
+            clean_temp(user_id)
+            file_mode = 'w'
+        else:
+            file_mode = 'a'
+            
         with open(p['srt'], file_mode, encoding="utf-8") as f: f.write(text + "\n") 
         
         try:
@@ -480,7 +511,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(subs) > 0:
                 end = subs[-1].end
                 time_str = f"{end.hours:02d}:{end.minutes:02d}:{end.seconds:02d},{end.milliseconds:03d}"
-                reply_text = f"✅ **SRT Text Validated!**\n📊 **Total:** {len(subs)} Blocks\n⏱️ **End Time:** {time_str}\n\n*(Paste more or choose an action)*"
+                reply_text = f"✅ **SRT Text Validated!** (Old Cache Cleared)\n📊 **Total:** {len(subs)} Blocks\n⏱️ **End Time:** {time_str}\n\n*(Paste more or choose an action)*"
             else:
                 reply_text = "⚠️ Text saved, but no blocks detected."
         except Exception as e:
@@ -495,8 +526,9 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     p = get_paths(user_id)
     if msg.document.file_name.lower().endswith('.srt'):
+        clean_temp(user_id)
         await (await msg.document.get_file()).download_to_drive(p['srt'])
-        await msg.reply_text("✅ **SRT File Loaded.** Ready for action!", reply_markup=get_action_keyboard())
+        await msg.reply_text("✅ **SRT File Loaded.** (Old Cache Cleared)\nReady for action!", reply_markup=get_action_keyboard())
     else:
         await msg.reply_text("❌ Please send an `.srt` file.")
 
@@ -510,26 +542,16 @@ async def run_server():
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
     print(f"🌐 Server on {PORT}")
 
-# 🚀 BUG FIX: Cleaned up run_polling to modern PTB v20+ standard
 async def main():
     bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
-    
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("clearall", clearall_command))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
     
-    # ChatGPT ဖျက်ခိုင်းခဲ့တဲ့ မှန်ကန်တဲ့ PTB v20+ Custom Loop အပိုင်းကို ပြန်ထည့်ခြင်း
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling()
-    
-    # Web Server ကို နောက်ကွယ်မှာ ပြိုင်တူ Run ခြင်း
     asyncio.create_task(run_server())
     
-    # Bot ကို မပိတ်သွားအောင် ဆက်ဖွင့်ထားပေးခြင်း
-    await asyncio.Event().wait()
+    await bot_app.run_polling()
 
-if __name__ == '__main__': 
-    asyncio.run(main())
+if __name__ == '__main__': asyncio.run(main())
