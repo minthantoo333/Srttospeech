@@ -558,8 +558,16 @@ async def main():
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
     
+    # ၁။ Bot ကို Manual စတင်ခြင်း (Web Server နဲ့ တွဲသုံးဖို့ အမှန်ကန်ဆုံးနည်းလမ်း)
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
+    
+    # ၂။ Render အတွက် Web Server ကို နောက်ကွယ်မှာ ပြိုင်တူ Run ခြင်း
     asyncio.create_task(run_server())
     
-    await bot_app.run_polling()
+    # ၃။ Bot ရော Web Server ရော မပိတ်သွားစေရန် Event Loop ကို အမြဲဖွင့်ထားခြင်း
+    await asyncio.Event().wait()
 
-if __name__ == '__main__': asyncio.run(main())
+if __name__ == '__main__': 
+    asyncio.run(main())
