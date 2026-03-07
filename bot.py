@@ -68,10 +68,10 @@ user_prefs = {}
 def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
-            "dub_voice": "my-MM-ThihaNeural", # Changed default to Thiha
+            "dub_voice": "my-MM-ThihaNeural", 
             "video_speed": "auto", 
             "base_rate": "+20%",
-            "max_fit": 70 # Default max limit for the squeeze
+            "max_fit": 70 
         }
     return user_prefs[user_id]
 
@@ -113,84 +113,85 @@ def process_length_and_trim(file_path):
 
 def compose_final_audio(chunks_data, duration_ms, output_path):
     final_audio = AudioSegment.silent(duration=duration_ms + 2000) 
-    
     for start_ms, file_path in chunks_data:
+        if not file_path: continue
         try:
             segment = AudioSegment.from_file(file_path)
             segment = make_audio_crisp(segment)
-            
             if start_ms + len(segment) > len(final_audio):
                 final_audio += AudioSegment.silent(duration=(start_ms + len(segment) - len(final_audio) + 2000))
-            
             final_audio = final_audio.overlay(segment, position=start_ms)
         except Exception as e:
             print(f"Error processing chunk {file_path}: {e}")
             
     final_audio.export(output_path, format="mp3", bitrate="192k")
 
-# --- ⚡ CONCURRENT TASK WORKER ---
-async def process_single_chunk(sub, index, user_id, voice, base_rate, max_fit, semaphore, progress_cb, max_retries=3):
+# --- ⚡ PHASE 1: MEASURE BASE AUDIO ---
+async def measure_base_chunk(chunk, user_id, voice, base_rate_str, semaphore, progress_cb):
     async with semaphore:
-        start_ms = sub.start.ordinal
-        end_ms = sub.end.ordinal
-        allowed_duration_ms = end_ms - start_ms
-        
-        text = sub.text.replace("\n", " ").strip()
+        idx = chunk["index"]
+        text = chunk["text"]
         if not text: 
             await progress_cb()
-            return None 
+            return {"index": idx, "len": 0, "path": None, "text": ""}
 
-        temp_filename = f"temp/{user_id}_chunk_{index}.mp3"
-        PITCH_VAL = "-2Hz"
-        
-        try:
-            base_rate_int = int(base_rate.replace("%", "").replace("+", "").replace("-", ""))
-            if "-" in base_rate: 
-                base_rate_int = -base_rate_int
-        except:
-            base_rate_int = 20 
-            
-        current_rate_str = base_rate
-        
-        for attempt in range(max_retries):
+        path = f"temp/{user_id}_chunk_{idx}_base.mp3"
+        for attempt in range(3):
             try:
-                communicate = edge_tts.Communicate(text, voice, rate=current_rate_str, pitch=PITCH_VAL)
-                await communicate.save(temp_filename)
-                
-                current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
-                
-                ratio = 1.0
-                if allowed_duration_ms > 0:
-                    ratio = current_len / allowed_duration_ms
-
-                # 🚨 THE SQUEEZE MECHANISM (Uses user-selected max_fit limit)
-                if ratio > 1.0:
-                    extra_speed_needed = (ratio - 1) * 100
-                    new_rate_int = int(base_rate_int + extra_speed_needed + 5)
-                    
-                    if new_rate_int > max_fit: 
-                        new_rate_int = max_fit
-                        
-                    if new_rate_int > base_rate_int:
-                        current_rate_str = f"+{new_rate_int}%"
-                        communicate = edge_tts.Communicate(text, voice, rate=current_rate_str, pitch=PITCH_VAL)
-                        await communicate.save(temp_filename)
-                        current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
-                        ratio = current_len / allowed_duration_ms
-
-                await progress_cb() # Update Telegram UI
-                return {
-                    "index": index,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                    "file_path": temp_filename,
-                    "ratio": ratio
-                }
+                comm = edge_tts.Communicate(text, voice, rate=base_rate_str, pitch="-2Hz")
+                await comm.save(path)
+                length = await asyncio.to_thread(process_length_and_trim, path)
+                await progress_cb()
+                return {"index": idx, "len": length, "path": path, "text": text}
             except Exception as e:
-                print(f"⚠️ Network error chunk {index}: {e}")
-                if attempt == max_retries - 1:
-                    raise Exception(f"Failed chunk {index} after {max_retries} attempts.")
-                await asyncio.sleep(1) 
+                if attempt == 2:
+                    print(f"⚠️ Phase 1 Failed chunk {idx}: {e}")
+                    return {"index": idx, "len": 0, "path": None, "text": ""}
+                await asyncio.sleep(1)
+
+# --- ⚡ PHASE 2: FINAL PERFECT FIT GENERATION ---
+async def process_final_chunk(chunk, base_res, global_ratio, user_id, voice, base_rate_int, max_fit, semaphore, progress_cb):
+    async with semaphore:
+        idx = chunk["index"]
+        start_ms = chunk["start"]
+        stretched_gap = chunk["gap"] * global_ratio
+        new_start_ms = int(start_ms * global_ratio)
+
+        if not base_res or base_res["len"] == 0:
+            await progress_cb()
+            return (new_start_ms, None)
+
+        base_len = base_res["len"]
+        base_path = base_res["path"]
+        text = base_res["text"]
+
+        # PERFECT FIT LOGIC: Borrow space if it fits the new gap naturally
+        if base_len <= stretched_gap:
+            await progress_cb()
+            return (new_start_ms, base_path) 
+            
+        # If it doesn't fit, calculate exactly how much to squeeze (no more, no less)
+        ratio = base_len / stretched_gap
+        extra_speed = (ratio - 1) * 100
+        new_rate_int = int(base_rate_int + extra_speed + 5) # +5% safety buffer
+
+        if new_rate_int > max_fit: new_rate_int = max_fit
+
+        final_path = f"temp/{user_id}_chunk_{idx}_final.mp3"
+        rate_str = f"+{new_rate_int}%"
+        
+        for attempt in range(3):
+            try:
+                comm = edge_tts.Communicate(text, voice, rate=rate_str, pitch="-2Hz")
+                await comm.save(final_path)
+                await asyncio.to_thread(process_length_and_trim, final_path)
+                await progress_cb()
+                return (new_start_ms, final_path)
+            except Exception:
+                if attempt == 2: 
+                    await progress_cb()
+                    return (new_start_ms, base_path) # Fallback to base
+                await asyncio.sleep(1)
 
 # --- 🎬 DUBBING ENGINE ---
 async def generate_dubbing(user_id, srt_path, output_path, state, status_msg):
@@ -199,72 +200,102 @@ async def generate_dubbing(user_id, srt_path, output_path, state, status_msg):
         if not subs: return False, "SRT file is empty.", "Unknown"
 
         voice = state['dub_voice']
-        base_rate = state['base_rate']
+        base_rate_str = state['base_rate']
         target_speed = state['video_speed']
         max_fit = state['max_fit']
         
-        total_chunks = len(subs)
-        completed_chunks = 0
+        try:
+            base_rate_int = int(base_rate_str.replace("%", "").replace("+", "").replace("-", ""))
+            if "-" in base_rate_str: base_rate_int = -base_rate_int
+        except: base_rate_int = 20
+
+        base_speed_factor = 1.0 + (base_rate_int / 100.0)
+        max_speed_factor = 1.0 + (max_fit / 100.0)
+
+        # 1. Structure the Data (Borrowing up to the NEXT subtitle's start time)
+        chunks_data = []
+        for i, sub in enumerate(subs):
+            start_ms = sub.start.ordinal
+            end_ms = sub.end.ordinal
+            # If not the last sub, the gap is up to the NEXT sub's start time.
+            if i + 1 < len(subs):
+                next_start_ms = subs[i+1].start.ordinal
+            else:
+                next_start_ms = end_ms + 2000 # Give the final sub a 2-second buffer
+                
+            gap_duration = next_start_ms - start_ms
+            text = sub.text.replace("\n", " ").strip()
+            chunks_data.append({"index": i, "start": start_ms, "end": end_ms, "gap": gap_duration, "text": text})
+
+        total_tasks = len(chunks_data) * 2 # Phase 1 + Phase 2
+        completed_tasks = 0
         last_update_time = time.time()
 
-        # UI Progress Callback Function
-        async def update_progress():
-            nonlocal completed_chunks, last_update_time
-            completed_chunks += 1
+        async def update_progress(phase_name):
+            nonlocal completed_tasks, last_update_time
+            completed_tasks += 1
             now = time.time()
-            # Only edit telegram message every 2 seconds to avoid API bans, or at 100%
-            if now - last_update_time > 2.0 or completed_chunks == total_chunks:
-                percent = int((completed_chunks / total_chunks) * 100)
+            if now - last_update_time > 2.0 or completed_tasks == total_tasks:
+                percent = int((completed_tasks / total_tasks) * 100)
                 try:
                     await status_msg.edit_text(
-                        f"🎬 **Dubbing...**\n"
-                        f"🎙️ Base: `{base_rate}` | 🗜️ Max Fit: `+{max_fit}%`\n"
+                        f"🎬 **Dubbing ({phase_name})...**\n"
+                        f"🎙️ Base: `{base_rate_str}` | 🗜️ Max Fit: `+{max_fit}%`\n"
                         f"⏱️ Mode: `{target_speed}`\n\n"
-                        f"⏳ **Processing: {percent}%** ({completed_chunks}/{total_chunks})"
+                        f"⏳ **Processing: {percent}%**"
                     )
                     last_update_time = now
-                except Exception:
-                    pass
+                except Exception: pass
 
-        max_ratio = 1.0 
-        semaphore = asyncio.Semaphore(5) 
-        tasks = []
+        # --- PHASE 1: Blueprint Math ---
+        semaphore = asyncio.Semaphore(5)
+        p1_tasks = [measure_base_chunk(c, user_id, voice, base_rate_str, semaphore, lambda: update_progress("Phase 1/2")) for c in chunks_data]
+        p1_results_list = await asyncio.gather(*p1_tasks)
+        
+        # Organize results into a dictionary by index
+        base_results = {res["index"]: res for res in p1_results_list if res is not None}
 
-        for i, sub in enumerate(subs):
-            tasks.append(process_single_chunk(sub, i, user_id, voice, base_rate, max_fit, semaphore, update_progress))
-
-        results = await asyncio.gather(*tasks)
-
-        valid_results = [res for res in results if res is not None]
-        valid_results.sort(key=lambda x: x["index"])
-
-        chunks_data = []
-        for res in valid_results:
-            if res["ratio"] > max_ratio: max_ratio = res["ratio"]
-            chunks_data.append((res["start_ms"], res["end_ms"], res["file_path"]))
-
-        # --- APPLY CLEAN 1-DECIMAL MATH ---
-        if target_speed == "auto":
-            raw_calculated_speed = 1.0 / max_ratio
+        # Calculate Global Stretch Ratio
+        max_ratio_needed = 1.0
+        for chunk in chunks_data:
+            idx = chunk["index"]
+            res = base_results.get(idx)
+            if not res or res["len"] == 0: continue
             
-            # Floor to the nearest 0.1 (e.g. 0.88 becomes 0.8) to guarantee NO overlap
-            clean_speed = math.floor(raw_calculated_speed * 10) / 10.0
-            
-            if clean_speed < 0.6: clean_speed = 0.6
+            base_len = res["len"]
+            gap = chunk["gap"]
+
+            if base_len > gap:
+                # Math: If we squeezed this from Base to Max Fit, how small would it get?
+                shrink_factor = base_speed_factor / max_speed_factor
+                min_possible_len = base_len * shrink_factor
                 
-            applied_ratio = 1.0 / clean_speed
+                if min_possible_len > gap:
+                    ratio = min_possible_len / gap
+                    if ratio > max_ratio_needed:
+                        max_ratio_needed = ratio
+
+        # Apply 1-decimal clean math
+        if target_speed == "auto":
+            clean_speed = math.floor((1.0 / max_ratio_needed) * 10) / 10.0
+            if clean_speed < 0.6: clean_speed = 0.6
+            global_stretch_ratio = 1.0 / clean_speed
             final_speed_reported = f"{clean_speed}x (Auto)"
         else:
-            applied_ratio = 1.0 / float(target_speed)
+            global_stretch_ratio = 1.0 / float(target_speed)
             final_speed_reported = f"{target_speed}x (Manual)"
 
-        stretched_chunks = []
-        for start_ms, end_ms, file_path in chunks_data:
-            new_start_ms = int(start_ms * applied_ratio)
-            stretched_chunks.append((new_start_ms, file_path))
+        # --- PHASE 2: Perfect Polish ---
+        p2_tasks = []
+        for chunk in chunks_data:
+            res = base_results.get(chunk["index"])
+            p2_tasks.append(process_final_chunk(chunk, res, global_stretch_ratio, user_id, voice, base_rate_int, max_fit, semaphore, lambda: update_progress("Phase 2/2")))
+            
+        final_stretched_chunks = await asyncio.gather(*p2_tasks)
 
-        last_sub_end_ms = int(subs[-1].end.ordinal * applied_ratio)
-        await asyncio.to_thread(compose_final_audio, stretched_chunks, last_sub_end_ms, output_path)
+        # Stitch everything together
+        last_sub_end_ms = int(subs[-1].end.ordinal * global_stretch_ratio)
+        await asyncio.to_thread(compose_final_audio, final_stretched_chunks, last_sub_end_ms, output_path)
         
         clean_temp(user_id)
         return True, None, final_speed_reported
@@ -300,7 +331,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"⏱️ Video Speed: {speed_name}", callback_data="cmd_speed")]
     ]
     await update.message.reply_text(
-        "👋 **SRT Dubbing Studio (Turbo UI Edition)**\n"
+        "👋 **SRT Dubbing Studio (Perfect Fit Edition)**\n"
         "Send me an `.srt` file or paste SRT text to get started.", 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
