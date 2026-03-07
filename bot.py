@@ -22,7 +22,7 @@ if not TG_TOKEN:
     print("❌ ERROR: TG_TOKEN is missing! Set it in your environment variables.")
     exit()
 
-# --- 🗣️ VOICE LIBRARY ---
+# --- 🗣️ VOICE & SPEED LIBRARY ---
 VOICE_LIB = {
     "🇯🇵 Japanese (Female)": "ja-JP-NanamiNeural",
     "🇯🇵 Japanese (Male)": "ja-JP-KeitaNeural",
@@ -34,6 +34,13 @@ VOICE_LIB = {
     "🇺🇸 Andrew (Male)": "en-US-AndrewNeural"
 }
 
+SPEED_LIB = {
+    "1.0x (Normal)": 1.0,
+    "0.9x (Slightly Slow)": 0.9,
+    "0.8x (Slow)": 0.8,
+    "0.7x (Very Slow)": 0.7
+}
+
 BASE_FOLDERS = ["downloads", "temp"]
 for f in BASE_FOLDERS:
     os.makedirs(f, exist_ok=True)
@@ -43,9 +50,9 @@ user_prefs = {}
 # --- 🛠️ HELPER FUNCTIONS ---
 def get_user_state(user_id):
     if user_id not in user_prefs:
-        # Default voice is Burmese Female
         user_prefs[user_id] = {
-            "dub_voice": "my-MM-NilarNeural"
+            "dub_voice": "my-MM-NilarNeural", 
+            "video_speed": 1.0 # Default speed is normal
         }
     return user_prefs[user_id]
 
@@ -67,7 +74,7 @@ def wipe_user_data(user_id):
     clean_temp(user_id)
     if user_id in user_prefs: del user_prefs[user_id]
 
-# --- 🔊 AUDIO POST-PROCESSING ---
+# --- 🔊 AUDIO POST-PROCESSING (Sync functions to run in threads) ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
     if len(audio_segment) < 100:  
         return audio_segment
@@ -80,7 +87,7 @@ def make_audio_crisp(audio_segment):
     return effects.normalize(clean)
 
 def process_length_and_trim(file_path):
-    """Loads, trims, overwrites, and returns length of audio (Runs in thread)"""
+    """Loads, trims, overwrites, and returns length of audio (Runs in thread to prevent blocking)"""
     seg = AudioSegment.from_file(file_path)
     seg = trim_silence(seg)
     seg.export(file_path, format="mp3")
@@ -106,24 +113,25 @@ def compose_final_audio(chunks_data, duration_ms, output_path):
     final_audio = trim_silence(final_audio)
     final_audio.export(output_path, format="mp3", bitrate="192k")
 
-# --- 🎬 DUBBING ENGINE (AUTO-SPEED) ---
-async def generate_dubbing(user_id, srt_path, output_path, voice):
-    print(f"🎬 Starting Auto-Speed Dubbing for {user_id}...")
+# --- 🎬 DUBBING ENGINE ---
+async def generate_dubbing(user_id, srt_path, output_path, voice, target_speed):
+    print(f"🎬 Starting Dubbing for {user_id} at {target_speed}x speed...")
     try:
         subs = pysrt.open(srt_path)
         if not subs:
-            return False, "SRT file is empty.", 1.0
+            return False, "SRT file is empty."
 
-        chunks_data = []
-        # +20% represents a 1.2x base reading speed in edge-tts
-        BASE_RATE_VAL = "+20%" 
+        time_multiplier = 1.0 / target_speed
+        last_sub_end_ms = int(subs[-1].end.ordinal * time_multiplier)
+        
+        chunks_data = [] # Stores (start_ms, temp_file_path)
+        BASE_RATE_VAL = 10 
         PITCH_VAL = "-2Hz"
-        max_ratio = 1.0 
 
-        # PASS 1: Generate audio and find the maximum required stretch
         for i, sub in enumerate(subs):
-            start_ms = sub.start.ordinal
-            end_ms = sub.end.ordinal
+            # Calculate stretched timestamps dynamically
+            start_ms = int(sub.start.ordinal * time_multiplier)
+            end_ms = int(sub.end.ordinal * time_multiplier)
             allowed_duration_ms = end_ms - start_ms
             
             text = sub.text.replace("\n", " ").strip()
@@ -131,53 +139,42 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
 
             temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
             
-            # Generate TTS audio at 1.2x base rate
-            communicate = edge_tts.Communicate(text, voice, rate=BASE_RATE_VAL, pitch=PITCH_VAL)
+            # 1. Generate normal TTS audio
+            communicate = edge_tts.Communicate(text, voice, rate=f"+{BASE_RATE_VAL}%", pitch=PITCH_VAL)
             await communicate.save(temp_filename)
             
-            # Check actual audio length in background thread
+            # 2. Check length in background thread
             current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
 
-            # Calculate ratio if this specific audio exceeds its allowed SRT duration
-            if allowed_duration_ms > 0:
+            # 3. Speed up if still too long for the new stretched window
+            if current_len > allowed_duration_ms:
                 ratio = current_len / allowed_duration_ms
-                if ratio > max_ratio:
-                    max_ratio = ratio
+                extra_speed_needed = (ratio - 1) * 100
+                new_rate = int(BASE_RATE_VAL + extra_speed_needed + 5)
+                if new_rate > 70: new_rate = 70 # Increased cap to 70 for tight squeezes
+                
+                communicate = edge_tts.Communicate(text, voice, rate=f"+{new_rate}%", pitch=PITCH_VAL)
+                await communicate.save(temp_filename)
+                await asyncio.to_thread(process_length_and_trim, temp_filename)
 
-            chunks_data.append((start_ms, end_ms, temp_filename))
+            chunks_data.append((start_ms, temp_filename))
 
-        # Calculate the final global auto-speed
-        auto_speed = round(1.0 / max_ratio, 2)
-        
-        # SAFETY CAP: Prevent the video from becoming unreasonably slow due to one outlier
-        if auto_speed < 0.6:
-            print(f"⚠️ Warning: Calculated speed {auto_speed}x is too slow. Capping at 0.6x.")
-            auto_speed = 0.6
-            max_ratio = 1.0 / 0.6
-
-        # PASS 2: Calculate proportionately stretched timestamps
-        stretched_chunks = []
-        for start_ms, end_ms, file_path in chunks_data:
-            new_start_ms = int(start_ms * max_ratio)
-            stretched_chunks.append((new_start_ms, file_path))
-
-        last_sub_end_ms = int(subs[-1].end.ordinal * max_ratio)
-
-        # Offload the heavy audio stitching to a background thread
-        await asyncio.to_thread(compose_final_audio, stretched_chunks, last_sub_end_ms, output_path)
+        # 4. Offload the heavy audio stitching to a background thread
+        await asyncio.to_thread(compose_final_audio, chunks_data, last_sub_end_ms, output_path)
         
         clean_temp(user_id)
-        return True, None, auto_speed
+        return True, None
 
     except Exception as e:
         clean_temp(user_id)
-        return False, str(e), 1.0
+        return False, str(e)
 
 # --- 🤖 HANDLERS ---
 async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand("start", "🏠 Home"),
         BotCommand("voices", "🗣️ Change Voice"),
+        BotCommand("speed", "⏱️ Video Speed"),
         BotCommand("dub", "🎬 Dub Audio"),
         BotCommand("clearall", "🧹 Clear Data")
     ])
@@ -187,16 +184,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(user_id)
     
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
+    speed_val = state['video_speed']
     
     keyboard = [
-        [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")]
+        [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")],
+        [InlineKeyboardButton(f"⏱️ Target Video Speed: {speed_val}x", callback_data="cmd_speed")]
     ]
-    await update.message.reply_text(
-        "👋 **SRT Dubbing Studio (Auto-Sync Edition)**\n"
-        "Send me an `.srt` file or paste SRT text to get started.\n"
-        "*(Timestamps will stretch automatically to prevent overlaps)*", 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("👋 **SRT Dubbing Studio**\nSend me an `.srt` file or paste SRT text to get started.", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
@@ -211,6 +205,19 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message if update.message else update.callback_query.message
     await msg.reply_text("🗣️ **Select Narrator Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    row = []
+    for name, val in SPEED_LIB.items():
+        row.append(InlineKeyboardButton(name, callback_data=f"set_speed_{val}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row: keyboard.append(row)
+    
+    msg = update.message if update.message else update.callback_query.message
+    await msg.reply_text("⏱️ **Select your target Video Speed:**\n(Timestamps will stretch automatically to fit the slower video)", reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wipe_user_data(update.effective_user.id)
     await update.message.reply_text("🧹 **All temporary files cleared.**")
@@ -222,35 +229,21 @@ async def perform_dubbing(update, context):
     user_id = update.effective_user.id
     p = get_paths(user_id)
     state = get_user_state(user_id)
-    
-    # Handle both direct commands and button clicks
-    if update.callback_query:
-        msg = update.callback_query.message
-    else:
-        msg = update.message
+    msg = update.effective_message
 
     if not os.path.exists(p['srt']):
         await msg.reply_text("❌ **No SRT found. Please send an .srt file first.**")
         return
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
+    speed_val = state['video_speed']
+    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name} | {speed_val}x Speed)...**\nPlease wait, this is processed in the background.")
     
-    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name})...**\nAnalyzing subtitle lengths to calculate Auto-Speed. Please wait...")
-    
-    success, error, calculated_speed = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
+    success, error = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'], speed_val)
     
     if success:
         await status.delete()
-        caption = (
-            f"✅ **Dubbed successfully!**\n"
-            f"🗣️ Voice: {voice_name}\n"
-            f"⚡ **Auto-Applied Video Speed: {calculated_speed}x**"
-        )
-        await context.bot.send_audio(
-            chat_id=msg.chat_id, 
-            audio=open(p['dub_audio'], "rb"), 
-            caption=caption
-        )
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=f"✅ **Dubbed successfully!**\n🗣️ Voice: {voice_name}\n⏱️ Optimized for: {speed_val}x Video Speed")
     else:
         await status.edit_text(f"❌ Dubbing Failed: {error}")
 
@@ -264,11 +257,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await voices_command(update, context)
         await query.answer()
 
+    elif data == "cmd_speed":
+        await speed_command(update, context)
+        await query.answer()
+
     elif data.startswith("set_voice_"):
         new_voice = data.replace("set_voice_", "")
         state['dub_voice'] = new_voice
         v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom Voice")
         await query.message.edit_text(f"✅ Voice set to: **{v_name}**")
+
+    elif data.startswith("set_speed_"):
+        new_speed = float(data.replace("set_speed_", ""))
+        state['video_speed'] = new_speed
+        await query.message.edit_text(f"✅ Target Video Speed set to: **{new_speed}x**")
 
     elif data == "trigger_dub":
         await perform_dubbing(update, context)
@@ -326,6 +328,7 @@ async def main():
     bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("voices", voices_command))
+    bot_app.add_handler(CommandHandler("speed", speed_command))
     bot_app.add_handler(CommandHandler("dub", dub_command))
     bot_app.add_handler(CommandHandler("clearall", clearall_command))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
@@ -336,10 +339,8 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling()
     
-    # Start aiohttp server in the background
-    asyncio.create_task(run_server())
+    await run_server()
     
-    # Keep the bot running
     stop_event = asyncio.Event()
     await stop_event.wait()
 
