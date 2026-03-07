@@ -3,6 +3,8 @@ import glob
 import asyncio
 import pysrt
 import re 
+import time
+import math
 from aiohttp import web
 
 # Audio Processing
@@ -22,7 +24,7 @@ if not TG_TOKEN:
     print("❌ ERROR: TG_TOKEN is missing! Set it in your environment variables.")
     exit()
 
-# --- 🗣️ VOICE, SPEED & RATE LIBRARIES ---
+# --- 🗣️ LIBRARIES ---
 VOICE_LIB = {
     "🇯🇵 Japanese (Female)": "ja-JP-NanamiNeural",
     "🇯🇵 Japanese (Male)": "ja-JP-KeitaNeural",
@@ -50,6 +52,12 @@ RATE_LIB = {
     "🚀 Very Fast (+30%)": "+30%"
 }
 
+FIT_LIB = {
+    "🗜️ Max Fit +50%": 50,
+    "🗜️ Max Fit +60%": 60,
+    "🗜️ Max Fit +70%": 70
+}
+
 BASE_FOLDERS = ["downloads", "temp"]
 for f in BASE_FOLDERS:
     os.makedirs(f, exist_ok=True)
@@ -60,9 +68,10 @@ user_prefs = {}
 def get_user_state(user_id):
     if user_id not in user_prefs:
         user_prefs[user_id] = {
-            "dub_voice": "my-MM-NilarNeural",
+            "dub_voice": "my-MM-ThihaNeural", # Changed default to Thiha
             "video_speed": "auto", 
-            "base_rate": "+20%" 
+            "base_rate": "+20%",
+            "max_fit": 70 # Default max limit for the squeeze
         }
     return user_prefs[user_id]
 
@@ -119,8 +128,8 @@ def compose_final_audio(chunks_data, duration_ms, output_path):
             
     final_audio.export(output_path, format="mp3", bitrate="192k")
 
-# --- ⚡ CONCURRENT TASK WORKER (Base Rate + 70% Squeeze) ---
-async def process_single_chunk(sub, index, user_id, voice, base_rate, semaphore, max_retries=3):
+# --- ⚡ CONCURRENT TASK WORKER ---
+async def process_single_chunk(sub, index, user_id, voice, base_rate, max_fit, semaphore, progress_cb, max_retries=3):
     async with semaphore:
         start_ms = sub.start.ordinal
         end_ms = sub.end.ordinal
@@ -128,12 +137,12 @@ async def process_single_chunk(sub, index, user_id, voice, base_rate, semaphore,
         
         text = sub.text.replace("\n", " ").strip()
         if not text: 
+            await progress_cb()
             return None 
 
         temp_filename = f"temp/{user_id}_chunk_{index}.mp3"
         PITCH_VAL = "-2Hz"
         
-        # Safely parse the base rate string (e.g., "+20%") into an integer
         try:
             base_rate_int = int(base_rate.replace("%", "").replace("+", "").replace("-", ""))
             if "-" in base_rate: 
@@ -145,38 +154,31 @@ async def process_single_chunk(sub, index, user_id, voice, base_rate, semaphore,
         
         for attempt in range(max_retries):
             try:
-                # 1. Generate audio at the user's chosen base rate
                 communicate = edge_tts.Communicate(text, voice, rate=current_rate_str, pitch=PITCH_VAL)
                 await communicate.save(temp_filename)
                 
-                # 2. Check the actual length
                 current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
                 
                 ratio = 1.0
                 if allowed_duration_ms > 0:
                     ratio = current_len / allowed_duration_ms
 
-                # 3. 🚨 THE SQUEEZE MECHANISM (Fires to try and fit the gap)
+                # 🚨 THE SQUEEZE MECHANISM (Uses user-selected max_fit limit)
                 if ratio > 1.0:
                     extra_speed_needed = (ratio - 1) * 100
                     new_rate_int = int(base_rate_int + extra_speed_needed + 5)
                     
-                    # Hard cap at +70% to prevent server errors/chipmunk audio
-                    if new_rate_int > 70: 
-                        new_rate_int = 70
+                    if new_rate_int > max_fit: 
+                        new_rate_int = max_fit
                         
-                    # Only regenerate if the squeeze rate is actually faster than base rate
                     if new_rate_int > base_rate_int:
                         current_rate_str = f"+{new_rate_int}%"
-                        
                         communicate = edge_tts.Communicate(text, voice, rate=current_rate_str, pitch=PITCH_VAL)
                         await communicate.save(temp_filename)
                         current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
-                        
-                        # Recalculate ratio after max squeezing. 
-                        # If it STILL overflows, Auto-Sync will handle the rest.
                         ratio = current_len / allowed_duration_ms
 
+                await progress_cb() # Update Telegram UI
                 return {
                     "index": index,
                     "start_ms": start_ms,
@@ -185,26 +187,51 @@ async def process_single_chunk(sub, index, user_id, voice, base_rate, semaphore,
                     "ratio": ratio
                 }
             except Exception as e:
-                print(f"⚠️ Network error on chunk {index} (Attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"⚠️ Network error chunk {index}: {e}")
                 if attempt == max_retries - 1:
-                    raise Exception(f"Failed to process chunk {index} after {max_retries} attempts.")
+                    raise Exception(f"Failed chunk {index} after {max_retries} attempts.")
                 await asyncio.sleep(1) 
 
 # --- 🎬 DUBBING ENGINE ---
-async def generate_dubbing(user_id, srt_path, output_path, voice, target_speed, base_rate):
-    print(f"🎬 Starting Dubbing for {user_id} (Speed: {target_speed} | Rate: {base_rate})...")
+async def generate_dubbing(user_id, srt_path, output_path, state, status_msg):
     try:
         subs = pysrt.open(srt_path)
-        if not subs:
-            return False, "SRT file is empty.", "Unknown"
+        if not subs: return False, "SRT file is empty.", "Unknown"
+
+        voice = state['dub_voice']
+        base_rate = state['base_rate']
+        target_speed = state['video_speed']
+        max_fit = state['max_fit']
+        
+        total_chunks = len(subs)
+        completed_chunks = 0
+        last_update_time = time.time()
+
+        # UI Progress Callback Function
+        async def update_progress():
+            nonlocal completed_chunks, last_update_time
+            completed_chunks += 1
+            now = time.time()
+            # Only edit telegram message every 2 seconds to avoid API bans, or at 100%
+            if now - last_update_time > 2.0 or completed_chunks == total_chunks:
+                percent = int((completed_chunks / total_chunks) * 100)
+                try:
+                    await status_msg.edit_text(
+                        f"🎬 **Dubbing...**\n"
+                        f"🎙️ Base: `{base_rate}` | 🗜️ Max Fit: `+{max_fit}%`\n"
+                        f"⏱️ Mode: `{target_speed}`\n\n"
+                        f"⏳ **Processing: {percent}%** ({completed_chunks}/{total_chunks})"
+                    )
+                    last_update_time = now
+                except Exception:
+                    pass
 
         max_ratio = 1.0 
         semaphore = asyncio.Semaphore(5) 
         tasks = []
 
-        # PASS 1: Generate audio concurrently
         for i, sub in enumerate(subs):
-            tasks.append(process_single_chunk(sub, i, user_id, voice, base_rate, semaphore))
+            tasks.append(process_single_chunk(sub, i, user_id, voice, base_rate, max_fit, semaphore, update_progress))
 
         results = await asyncio.gather(*tasks)
 
@@ -213,34 +240,30 @@ async def generate_dubbing(user_id, srt_path, output_path, voice, target_speed, 
 
         chunks_data = []
         for res in valid_results:
-            if res["ratio"] > max_ratio:
-                max_ratio = res["ratio"]
+            if res["ratio"] > max_ratio: max_ratio = res["ratio"]
             chunks_data.append((res["start_ms"], res["end_ms"], res["file_path"]))
 
-        # --- APPLY SPEED LOGIC ---
+        # --- APPLY CLEAN 1-DECIMAL MATH ---
         if target_speed == "auto":
-            applied_ratio = max_ratio
-            calculated_speed = round(1.0 / applied_ratio, 2)
+            raw_calculated_speed = 1.0 / max_ratio
             
-            if calculated_speed < 0.6:
-                print(f"⚠️ Capping Auto-Speed at 0.6x.")
-                calculated_speed = 0.6
-                applied_ratio = 1.0 / 0.6
+            # Floor to the nearest 0.1 (e.g. 0.88 becomes 0.8) to guarantee NO overlap
+            clean_speed = math.floor(raw_calculated_speed * 10) / 10.0
+            
+            if clean_speed < 0.6: clean_speed = 0.6
                 
-            final_speed_reported = f"{calculated_speed}x (Auto)"
+            applied_ratio = 1.0 / clean_speed
+            final_speed_reported = f"{clean_speed}x (Auto)"
         else:
-            # Manual Mode
             applied_ratio = 1.0 / float(target_speed)
             final_speed_reported = f"{target_speed}x (Manual)"
 
-        # PASS 2: Calculate proportionately stretched timestamps
         stretched_chunks = []
         for start_ms, end_ms, file_path in chunks_data:
             new_start_ms = int(start_ms * applied_ratio)
             stretched_chunks.append((new_start_ms, file_path))
 
         last_sub_end_ms = int(subs[-1].end.ordinal * applied_ratio)
-
         await asyncio.to_thread(compose_final_audio, stretched_chunks, last_sub_end_ms, output_path)
         
         clean_temp(user_id)
@@ -256,7 +279,8 @@ async def post_init(application):
         BotCommand("start", "🏠 Home"),
         BotCommand("voices", "🗣️ Voice"),
         BotCommand("rate", "🎙️ Base Rate"),
-        BotCommand("speed", "⏱️ Speed"),
+        BotCommand("fit", "🗜️ Max Fit Speed"),
+        BotCommand("speed", "⏱️ Video Speed"),
         BotCommand("dub", "🎬 Dub"),
         BotCommand("clearall", "🧹 Clear")
     ])
@@ -266,60 +290,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(user_id)
     
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Unknown")
-    speed_val = state['video_speed']
-    speed_name = next((k for k, v in SPEED_LIB.items() if v == speed_val), f"{speed_val}x")
-    rate_val = state['base_rate']
-    rate_name = next((k for k, v in RATE_LIB.items() if v == rate_val), rate_val)
+    speed_name = next((k for k, v in SPEED_LIB.items() if v == state['video_speed']), f"{state['video_speed']}x")
+    rate_name = next((k for k, v in RATE_LIB.items() if v == state['base_rate']), state['base_rate'])
+    fit_name = f"+{state['max_fit']}%"
     
     keyboard = [
         [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")],
-        [InlineKeyboardButton(f"🎙️ Speak Rate: {rate_name}", callback_data="cmd_rate")],
-        [InlineKeyboardButton(f"⏱️ Speed: {speed_name}", callback_data="cmd_speed")]
+        [InlineKeyboardButton(f"🎙️ Rate: {rate_name}", callback_data="cmd_rate"), InlineKeyboardButton(f"🗜️ Max Fit: {fit_name}", callback_data="cmd_fit")],
+        [InlineKeyboardButton(f"⏱️ Video Speed: {speed_name}", callback_data="cmd_speed")]
     ]
     await update.message.reply_text(
-        "👋 **SRT Dubbing Studio (Turbo Edition)**\n"
+        "👋 **SRT Dubbing Studio (Turbo UI Edition)**\n"
         "Send me an `.srt` file or paste SRT text to get started.", 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu(update, context, lib, prefix, text_msg):
     keyboard = []
     row = []
-    for name, code in VOICE_LIB.items():
-        row.append(InlineKeyboardButton(name, callback_data=f"set_voice_{code}"))
+    for name, val in lib.items():
+        row.append(InlineKeyboardButton(name, callback_data=f"{prefix}_{val}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row: keyboard.append(row)
     
     msg = update.message if update.message else update.callback_query.message
-    await msg.reply_text("🗣️ **Select Narrator Voice:**", reply_markup=InlineKeyboardMarkup(keyboard))
+    await msg.reply_text(text_msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = []
-    row = []
-    for name, val in RATE_LIB.items():
-        row.append(InlineKeyboardButton(name, callback_data=f"set_rate_{val}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row: keyboard.append(row)
-    
-    msg = update.message if update.message else update.callback_query.message
-    await msg.reply_text("🎙️ **Select Base TTS Speak Rate:**\n*(How fast the AI talks naturally)*", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = []
-    row = []
-    for name, val in SPEED_LIB.items():
-        row.append(InlineKeyboardButton(name, callback_data=f"set_speed_{val}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row: keyboard.append(row)
-    
-    msg = update.message if update.message else update.callback_query.message
-    await msg.reply_text("⏱️ **Select Video Speed Mode:**\n*(How timestamps stretch to prevent overlaps)*", reply_markup=InlineKeyboardMarkup(keyboard))
+async def voices_command(u, c): await handle_menu(u, c, VOICE_LIB, "set_voice", "🗣️ **Select Narrator Voice:**")
+async def rate_command(u, c): await handle_menu(u, c, RATE_LIB, "set_rate", "🎙️ **Select Base TTS Speak Rate:**")
+async def fit_command(u, c): await handle_menu(u, c, FIT_LIB, "set_fit", "🗜️ **Select Max Emergency Squeeze Speed:**\n*(Limits how fast the AI is allowed to talk to fit a gap)*")
+async def speed_command(u, c): await handle_menu(u, c, SPEED_LIB, "set_speed", "⏱️ **Select Video Speed Mode:**\n*(Auto mathematically prevents overlaps)*")
 
 async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wipe_user_data(update.effective_user.id)
@@ -332,38 +334,27 @@ async def perform_dubbing(update, context):
     user_id = update.effective_user.id
     p = get_paths(user_id)
     state = get_user_state(user_id)
-    
-    if update.callback_query:
-        msg = update.callback_query.message
-    else:
-        msg = update.message
+    msg = update.callback_query.message if update.callback_query else update.message
 
     if not os.path.exists(p['srt']):
         await msg.reply_text("❌ **No SRT found. Please send an .srt file first.**")
         return
 
-    voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
-    speed_mode = state['video_speed']
-    base_rate = state['base_rate']
+    status_msg = await msg.reply_text("🎬 **Dubbing Initializing...**\n⏳ **Processing: 0%**")
     
-    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name})...**\n🎙️ Base Rate: `{base_rate}`\n⏱️ Speed Mode: `{speed_mode}`\nProcessing audio...")
-    
-    success, error, final_speed = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'], speed_mode, base_rate)
+    success, error, final_speed = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state, status_msg)
     
     if success:
-        await status.delete()
+        voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
+        await status_msg.delete()
         caption = (
             f"✅ **Dubbed successfully!**\n"
             f"🗣️ Voice: {voice_name}\n"
-            f"⚡ **Video Speed Applied: {final_speed}**"
+            f"⚡ **Clean Video Speed Applied: {final_speed}**"
         )
-        await context.bot.send_audio(
-            chat_id=msg.chat_id, 
-            audio=open(p['dub_audio'], "rb"), 
-            caption=caption
-        )
+        await context.bot.send_audio(chat_id=msg.chat_id, audio=open(p['dub_audio'], "rb"), caption=caption)
     else:
-        await status.edit_text(f"❌ Dubbing Failed: {error}")
+        await status_msg.edit_text(f"❌ Dubbing Failed: {error}")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -371,40 +362,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user_state(user_id)
     data = query.data
     
-    if data == "cmd_voices":
-        await voices_command(update, context)
-        await query.answer()
-
-    elif data == "cmd_speed":
-        await speed_command(update, context)
-        await query.answer()
-        
-    elif data == "cmd_rate":
-        await rate_command(update, context)
-        await query.answer()
-
+    if data == "cmd_voices": await voices_command(update, context)
+    elif data == "cmd_speed": await speed_command(update, context)
+    elif data == "cmd_rate": await rate_command(update, context)
+    elif data == "cmd_fit": await fit_command(update, context)
+    elif data == "trigger_dub": await perform_dubbing(update, context)
+    
     elif data.startswith("set_voice_"):
-        new_voice = data.replace("set_voice_", "")
-        state['dub_voice'] = new_voice
-        v_name = next((k for k, v in VOICE_LIB.items() if v == new_voice), "Custom Voice")
+        state['dub_voice'] = data.replace("set_voice_", "")
+        v_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Voice")
         await query.message.edit_text(f"✅ Voice set to: **{v_name}**")
 
     elif data.startswith("set_rate_"):
-        new_rate = data.replace("set_rate_", "")
-        state['base_rate'] = new_rate
-        r_name = next((k for k, v in RATE_LIB.items() if v == new_rate), new_rate)
+        state['base_rate'] = data.replace("set_rate_", "")
+        r_name = next((k for k, v in RATE_LIB.items() if v == state['base_rate']), state['base_rate'])
         await query.message.edit_text(f"✅ Base Speak Rate set to: **{r_name}**")
+
+    elif data.startswith("set_fit_"):
+        state['max_fit'] = int(data.replace("set_fit_", ""))
+        await query.message.edit_text(f"✅ Max Fit Limit set to: **+{state['max_fit']}%**")
 
     elif data.startswith("set_speed_"):
         val = data.replace("set_speed_", "")
-        new_speed = "auto" if val == "auto" else float(val)
-        state['video_speed'] = new_speed
-        s_name = next((k for k, v in SPEED_LIB.items() if v == new_speed), f"{new_speed}x")
+        state['video_speed'] = "auto" if val == "auto" else float(val)
+        s_name = next((k for k, v in SPEED_LIB.items() if v == state['video_speed']), f"{state['video_speed']}x")
         await query.message.edit_text(f"✅ Target Video Speed set to: **{s_name}**")
 
-    elif data == "trigger_dub":
-        await perform_dubbing(update, context)
-        await query.answer()
+    await query.answer()
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -413,95 +397,56 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = get_paths(user_id)
 
     if re.search(r'\d{2}:\d{2}:\d{2},\d{3}', text):
-        file_mode = 'a'
-        if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n'):
-            file_mode = 'w'
-        
-        with open(p['srt'], file_mode, encoding="utf-8") as f: 
-            f.write(text + "\n") 
+        file_mode = 'w' if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n') else 'a'
+        with open(p['srt'], file_mode, encoding="utf-8") as f: f.write(text + "\n") 
         
         try:
-            with open(p['srt'], 'r', encoding="utf-8") as f:
-                raw_content = f.read()
-
+            with open(p['srt'], 'r', encoding="utf-8") as f: raw_content = f.read()
             pattern = re.compile(r'(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\d+\s*\n\d{2}:\d{2}|\Z)', re.DOTALL)
-            matches = pattern.findall(raw_content)
-
-            clean_srt = ""
-            for match in matches:
-                index = match[0].strip()
-                timestamp = match[1].strip()
-                sub_text = "\n".join([line for line in match[2].split('\n') if line.strip()])
-                clean_srt += f"{index}\n{timestamp}\n{sub_text}\n\n"
-
-            with open(p['srt'], 'w', encoding="utf-8") as f:
-                f.write(clean_srt)
-                
-        except Exception as e:
-            print(f"Cleaner Error: {e}")
+            clean_srt = "".join([f"{m[0].strip()}\n{m[1].strip()}\n{chr(10).join([L for L in m[2].split(chr(10)) if L.strip()])}\n\n" for m in pattern.findall(raw_content)])
+            with open(p['srt'], 'w', encoding="utf-8") as f: f.write(clean_srt)
+        except Exception as e: print(f"Cleaner Error: {e}")
 
         try:
             subs = pysrt.open(p['srt'])
             if len(subs) > 0:
-                total_lines = len(subs)
-                latest_end = subs[-1].end
-                time_str = f"{latest_end.hours:02d}:{latest_end.minutes:02d}:{latest_end.seconds:02d},{latest_end.milliseconds:03d}"
-                
-                reply_text = (
-                    f"✅ **SRT Text Saved & Auto-Cleaned!**\n"
-                    f"📊 **Total Valid Blocks:** {total_lines}\n"
-                    f"⏱️ **Latest Timestamp:** {time_str}\n\n"
-                    f"*(Paste more to append, or click below to start)*"
-                )
+                end = subs[-1].end
+                time_str = f"{end.hours:02d}:{end.minutes:02d}:{end.seconds:02d},{end.milliseconds:03d}"
+                reply_text = f"✅ **SRT Text Validated!**\n📊 **Total:** {len(subs)}\n⏱️ **End:** {time_str}\n\n*(Paste more or click start)*"
             else:
-                reply_text = "⚠️ Text saved, but no valid subtitle blocks could be extracted. Please check the formatting."
+                reply_text = "⚠️ Text saved, but no blocks detected."
         except Exception as e:
-            reply_text = f"⚠️ Text saved, but parsing failed: {e}"
+            reply_text = f"⚠️ Parsing failed: {e}"
 
         keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
         await msg.reply_text(reply_text, reply_markup=InlineKeyboardMarkup(keyboard))
-        
     else:
-        await msg.reply_text("ℹ️ Please send an `.srt` file or paste valid SRT text format containing timestamps.")
+        await msg.reply_text("ℹ️ Please send an `.srt` file or paste valid SRT text.")
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
     p = get_paths(user_id)
-    file_obj = await msg.document.get_file()
-    name = msg.document.file_name
-    
-    if name.lower().endswith('.srt'):
-        await file_obj.download_to_drive(p['srt'])
-        keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
-        await msg.reply_text("✅ **SRT File Loaded.** Ready to dub!", reply_markup=InlineKeyboardMarkup(keyboard))
+    if msg.document.file_name.lower().endswith('.srt'):
+        await (await msg.document.get_file()).download_to_drive(p['srt'])
+        await msg.reply_text("✅ **SRT File Loaded.** Ready to dub!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]))
     else:
-        await msg.reply_text("❌ Please send an `.srt` subtitle file.")
+        await msg.reply_text("❌ Please send an `.srt` file.")
 
-# --- 🌐 UPTIME WEB SERVER ---
-async def health_check(request):
-    return web.Response(text="Bot is running smoothly!", status=200)
+async def health_check(request): return web.Response(text="Bot running!", status=200)
 
 async def run_server():
     app = web.Application()
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"🌐 Uptime Web Server running on port {PORT}")
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    print(f"🌐 Server on {PORT}")
 
-# --- 🚀 MAIN LOOP ---
 async def main():
-    print("🚀 Initializing Concurrent SRT Dubbing Bot...")
-    
     bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("voices", voices_command))
-    bot_app.add_handler(CommandHandler("rate", rate_command))
-    bot_app.add_handler(CommandHandler("speed", speed_command))
-    bot_app.add_handler(CommandHandler("dub", dub_command))
-    bot_app.add_handler(CommandHandler("clearall", clearall_command))
+    for cmd, hndlr in [("start", start), ("voices", voices_command), ("rate", rate_command), ("fit", fit_command), ("speed", speed_command), ("dub", dub_command), ("clearall", clearall_command)]:
+        bot_app.add_handler(CommandHandler(cmd, hndlr))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
@@ -509,11 +454,7 @@ async def main():
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
-    
     asyncio.create_task(run_server())
-    
-    stop_event = asyncio.Event()
-    await stop_event.wait()
+    await asyncio.Event().wait()
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == '__main__': asyncio.run(main())
