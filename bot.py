@@ -43,6 +43,7 @@ user_prefs = {}
 # --- 🛠️ HELPER FUNCTIONS ---
 def get_user_state(user_id):
     if user_id not in user_prefs:
+        # Default voice is Burmese Female
         user_prefs[user_id] = {
             "dub_voice": "my-MM-NilarNeural"
         }
@@ -105,79 +106,56 @@ def compose_final_audio(chunks_data, duration_ms, output_path):
     final_audio = trim_silence(final_audio)
     final_audio.export(output_path, format="mp3", bitrate="192k")
 
-# --- ⚡ CONCURRENT TASK WORKER ---
-async def process_single_chunk(sub, index, user_id, voice, semaphore, max_retries=3):
-    """Generates TTS for a single subtitle line, safely limited by a semaphore, with retries."""
-    async with semaphore:
-        start_ms = sub.start.ordinal
-        end_ms = sub.end.ordinal
-        allowed_duration_ms = end_ms - start_ms
-        
-        text = sub.text.replace("\n", " ").strip()
-        if not text: 
-            return None 
-
-        temp_filename = f"temp/{user_id}_chunk_{index}.mp3"
-        BASE_RATE_VAL = "+20%" 
-        PITCH_VAL = "-2Hz"
-        
-        for attempt in range(max_retries):
-            try:
-                communicate = edge_tts.Communicate(text, voice, rate=BASE_RATE_VAL, pitch=PITCH_VAL)
-                await communicate.save(temp_filename)
-                
-                current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
-                
-                ratio = 1.0
-                if allowed_duration_ms > 0:
-                    ratio = current_len / allowed_duration_ms
-                    
-                return {
-                    "index": index,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                    "file_path": temp_filename,
-                    "ratio": ratio
-                }
-            except Exception as e:
-                print(f"⚠️ Network error on chunk {index} (Attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt == max_retries - 1:
-                    raise Exception(f"Failed to process chunk {index} after {max_retries} attempts.")
-                await asyncio.sleep(1) 
-
-# --- 🎬 DUBBING ENGINE (AUTO-SPEED & CONCURRENT) ---
+# --- 🎬 DUBBING ENGINE (AUTO-SPEED) ---
 async def generate_dubbing(user_id, srt_path, output_path, voice):
-    print(f"🎬 Starting Concurrent Dubbing for {user_id}...")
+    print(f"🎬 Starting Auto-Speed Dubbing for {user_id}...")
     try:
         subs = pysrt.open(srt_path)
         if not subs:
             return False, "SRT file is empty.", 1.0
 
-        max_ratio = 1.0 
-        semaphore = asyncio.Semaphore(5) 
-        tasks = []
-
-        for i, sub in enumerate(subs):
-            tasks.append(process_single_chunk(sub, i, user_id, voice, semaphore))
-
-        results = await asyncio.gather(*tasks)
-
-        valid_results = [res for res in results if res is not None]
-        valid_results.sort(key=lambda x: x["index"])
-
         chunks_data = []
-        for res in valid_results:
-            if res["ratio"] > max_ratio:
-                max_ratio = res["ratio"]
-            chunks_data.append((res["start_ms"], res["end_ms"], res["file_path"]))
+        # +20% represents a 1.2x base reading speed in edge-tts
+        BASE_RATE_VAL = "+20%" 
+        PITCH_VAL = "-2Hz"
+        max_ratio = 1.0 
 
+        # PASS 1: Generate audio and find the maximum required stretch
+        for i, sub in enumerate(subs):
+            start_ms = sub.start.ordinal
+            end_ms = sub.end.ordinal
+            allowed_duration_ms = end_ms - start_ms
+            
+            text = sub.text.replace("\n", " ").strip()
+            if not text: continue 
+
+            temp_filename = f"temp/{user_id}_chunk_{i}.mp3"
+            
+            # Generate TTS audio at 1.2x base rate
+            communicate = edge_tts.Communicate(text, voice, rate=BASE_RATE_VAL, pitch=PITCH_VAL)
+            await communicate.save(temp_filename)
+            
+            # Check actual audio length in background thread
+            current_len = await asyncio.to_thread(process_length_and_trim, temp_filename)
+
+            # Calculate ratio if this specific audio exceeds its allowed SRT duration
+            if allowed_duration_ms > 0:
+                ratio = current_len / allowed_duration_ms
+                if ratio > max_ratio:
+                    max_ratio = ratio
+
+            chunks_data.append((start_ms, end_ms, temp_filename))
+
+        # Calculate the final global auto-speed
         auto_speed = round(1.0 / max_ratio, 2)
         
+        # SAFETY CAP: Prevent the video from becoming unreasonably slow due to one outlier
         if auto_speed < 0.6:
             print(f"⚠️ Warning: Calculated speed {auto_speed}x is too slow. Capping at 0.6x.")
             auto_speed = 0.6
             max_ratio = 1.0 / 0.6
 
+        # PASS 2: Calculate proportionately stretched timestamps
         stretched_chunks = []
         for start_ms, end_ms, file_path in chunks_data:
             new_start_ms = int(start_ms * max_ratio)
@@ -185,6 +163,7 @@ async def generate_dubbing(user_id, srt_path, output_path, voice):
 
         last_sub_end_ms = int(subs[-1].end.ordinal * max_ratio)
 
+        # Offload the heavy audio stitching to a background thread
         await asyncio.to_thread(compose_final_audio, stretched_chunks, last_sub_end_ms, output_path)
         
         clean_temp(user_id)
@@ -213,7 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"🗣️ Voice: {voice_name}", callback_data="cmd_voices")]
     ]
     await update.message.reply_text(
-        "👋 **SRT Dubbing Studio (Turbo Auto-Sync Edition)**\n"
+        "👋 **SRT Dubbing Studio (Auto-Sync Edition)**\n"
         "Send me an `.srt` file or paste SRT text to get started.\n"
         "*(Timestamps will stretch automatically to prevent overlaps)*", 
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -244,6 +223,7 @@ async def perform_dubbing(update, context):
     p = get_paths(user_id)
     state = get_user_state(user_id)
     
+    # Handle both direct commands and button clicks
     if update.callback_query:
         msg = update.callback_query.message
     else:
@@ -255,7 +235,7 @@ async def perform_dubbing(update, context):
 
     voice_name = next((k for k, v in VOICE_LIB.items() if v == state['dub_voice']), "Selected Voice")
     
-    status = await msg.reply_text(f"🎬 **Turbo Dubbing ({voice_name})...**\nProcessing up to 5 lines simultaneously. Please wait...")
+    status = await msg.reply_text(f"🎬 **Dubbing ({voice_name})...**\nAnalyzing subtitle lengths to calculate Auto-Speed. Please wait...")
     
     success, error, calculated_speed = await generate_dubbing(user_id, p['srt'], p['dub_audio'], state['dub_voice'])
     
@@ -305,30 +285,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if re.match(r'^\s*1\s*$', text.split('\n')[0].strip()) or text.strip().startswith('1\n'):
             file_mode = 'w'
         
-        with open(p['srt'], file_mode, encoding="utf-8") as f: 
-            f.write(text + "\n\n") 
+        with open(p['srt'], file_mode, encoding="utf-8") as f: f.write(text + "\n")
         
-        try:
-            subs = pysrt.open(p['srt'])
-            if len(subs) > 0:
-                total_lines = len(subs)
-                latest_end = subs[-1].end
-                time_str = f"{latest_end.hours:02d}:{latest_end.minutes:02d}:{latest_end.seconds:02d},{latest_end.milliseconds:03d}"
-                
-                reply_text = (
-                    f"✅ **SRT Text Saved & Validated!**\n"
-                    f"📊 **Total Lines:** {total_lines}\n"
-                    f"⏱️ **Latest Timestamp:** {time_str}\n\n"
-                    f"*(Paste more to append, or click below to start)*"
-                )
-            else:
-                reply_text = "⚠️ Text saved, but no valid subtitle blocks were detected yet."
-        except Exception as e:
-            reply_text = "⚠️ Text saved, but there was an error parsing the SRT format."
-
         keyboard = [[InlineKeyboardButton("🎬 Dub Audio", callback_data="trigger_dub")]]
-        await msg.reply_text(reply_text, reply_markup=InlineKeyboardMarkup(keyboard))
-        
+        await msg.reply_text("✅ **SRT Text Detected and Saved!**\nWant to generate audio now?", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await msg.reply_text("ℹ️ Please send an `.srt` file or paste valid SRT text format.")
 
@@ -361,7 +321,7 @@ async def run_server():
 
 # --- 🚀 MAIN LOOP ---
 async def main():
-    print("🚀 Initializing Concurrent SRT Dubbing Bot...")
+    print("🚀 Initializing SRT Dubbing Bot...")
     
     bot_app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start))
@@ -376,8 +336,10 @@ async def main():
     await bot_app.start()
     await bot_app.updater.start_polling()
     
+    # Start aiohttp server in the background
     asyncio.create_task(run_server())
     
+    # Keep the bot running
     stop_event = asyncio.Event()
     await stop_event.wait()
 
