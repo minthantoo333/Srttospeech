@@ -295,7 +295,7 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
 
         # CALCULATE MATH & CATEGORIZE BOTTLENECKS
         max_ratio_needed = 1.0
-        bottleneck_categories = {} # Dictionary to store lines by speed category
+        bottleneck_categories = {}
 
         for chunk in chunks_data:
             idx = chunk["index"]
@@ -313,7 +313,6 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
                     if ratio > max_ratio_needed:
                         max_ratio_needed = ratio
                         
-                    # Calculate required speed for this specific line
                     line_speed = math.floor((1.0 / ratio) * 10) / 10.0
                     if line_speed < 0.6: line_speed = 0.6
                     
@@ -338,18 +337,26 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
             report += f"⚡ **Global Video Speed Needed:** `{final_speed_reported}`\n\n"
             
             if bottleneck_categories:
-                report += f"⚠️ **Bottleneck Lines Breakdown:**\n"
-                # Sort descending (e.g., 0.9, 0.8, 0.7, 0.6)
+                critical_found = False
+                critical_report = ""
+                # Only process lines that need 0.7x or 0.6x
                 for speed_cat in sorted(bottleneck_categories.keys(), reverse=True):
-                    lines = bottleneck_categories[speed_cat]
-                    b_str = ", ".join(lines[:12])
-                    if len(lines) > 12: b_str += "..."
-                    report += f"• Needs `{speed_cat}x`: Lines {b_str}\n"
-                report += f"\n💡 *Tip: Fix the {clean_speed}x lines first to improve overall video speed!*"
+                    if speed_cat <= 0.7:
+                        critical_found = True
+                        lines = bottleneck_categories[speed_cat]
+                        b_str = ", ".join(lines[:12])
+                        if len(lines) > 12: b_str += "..."
+                        critical_report += f"• Needs `{speed_cat}x`: Lines {b_str}\n"
+                
+                if critical_found:
+                    report += f"⚠️ **Critical Bottlenecks (0.7x & 0.6x):**\n" + critical_report
+                    report += f"\n💡 *Tip: Fix these specific lines to get the speed back to 0.8x or higher!*\n\n"
+                else:
+                    report += f"✅ **Acceptable Fit!** The required speed is `{final_speed_reported}`. No critical bottlenecks (< 0.8x) found.\n\n"
             else:
                 report += f"✅ **Perfect Fit!** All lines fit naturally inside the gaps.\n\n"
                 
-            report += "\n*(Settings cached. Click 'Generate' to create audio instantly!)*"
+            report += "*(Settings cached. Click 'Generate' to create audio instantly!)*"
             return True, None, report, friendly_voice_name
 
         # --- PHASE 2 ---
@@ -365,13 +372,14 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
         
         caption = f"✅ **Dubbed successfully!**\n🗣️ Global Voice: {friendly_voice_name}\n⚡ **Speed Applied: {final_speed_reported}**"
         
+        # Only complain in caption if there are critical lines <= 0.7
         if bottleneck_categories and target_speed == "auto":
-            # Just show the absolute worst offenders in the final output to keep it clean
             worst_speed = min(bottleneck_categories.keys())
-            worst_lines = bottleneck_categories[worst_speed]
-            b_str = ", ".join(worst_lines[:6])
-            if len(worst_lines) > 6: b_str += "..."
-            caption += f"\n⚠️ Pulled down to {worst_speed}x by lines: {b_str}"
+            if worst_speed <= 0.7:
+                worst_lines = bottleneck_categories[worst_speed]
+                b_str = ", ".join(worst_lines[:6])
+                if len(worst_lines) > 6: b_str += "..."
+                caption += f"\n⚠️ Pulled down to {worst_speed}x by lines: {b_str}"
             
         return True, None, caption, friendly_voice_name
 
