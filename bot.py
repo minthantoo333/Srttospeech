@@ -8,10 +8,11 @@ import math
 import hashlib
 from aiohttp import web
 
-# Audio Processing
+# Audio Processing & Transcription
 from pydub import AudioSegment, effects
 from pydub.silence import detect_leading_silence
 import edge_tts
+from faster_whisper import WhisperModel
 
 # Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -25,39 +26,40 @@ if not TG_TOKEN:
     print("❌ ERROR: TG_TOKEN is missing! Set it in your environment variables.")
     exit()
 
+# Initialize Fast Whisper Model (base model is very fast on CPU)
+print("Loading Whisper Model...")
+whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+print("Whisper Model Loaded.")
+
 # --- 🗣️ LIBRARIES ---
 VOICE_LIB = {
     "🇲🇲 Thiha (Male)": "my-MM-ThihaNeural",
     "🇲🇲 Nilar (Female)": "my-MM-NilarNeural", 
+    "🇬🇧 Sonia (Female)": "en-GB-SoniaNeural",
+    "🇬🇧 Ryan (Male)": "en-GB-RyanNeural",
+    "🇨🇳 Xiaoxiao (Female)": "zh-CN-XiaoxiaoNeural",
+    "🇨🇳 Yunxi (Male)": "zh-CN-YunxiNeural",
+    "🇰🇷 SunHi (Female)": "ko-KR-SunHiNeural",
+    "🇰🇷 InJoon (Male)": "ko-KR-InJoonNeural",
     "🇺🇸 Remy (Multi)": "en-US-RemyMultilingualNeural",
     "🇺🇸 Andrew (Multi)": "en-US-AndrewMultilingualNeural",
-    "🇺🇸 Brian (Multi)": "en-US-BrianMultilingualNeural",
-    "🇺🇸 Emma (Multi)": "en-US-EmmaMultilingualNeural",
-    "🇺🇸 Ava (Multi)": "en-US-AvaMultilingualNeural",
-    "🇮🇹 Giuseppe (Multi)": "it-IT-GiuseppeMultilingualNeural",
-    "🇫🇷 Vivienne (Multi)": "fr-FR-VivienneMultilingualNeural",
-    "🇩🇪 Florian (Multi)": "de-DE-FlorianMultilingualNeural",
-    "🇩🇪 Seraphina (Multi)": "de-DE-SeraphinaMultilingualNeural",
     "🇯🇵 Nanami (Female)": "ja-JP-NanamiNeural",
-    "🇯🇵 Keita (Male)": "ja-JP-KeitaNeural",
-    "🇰🇷 SunHi (Female)": "ko-KR-SunHiNeural"
+    "🇯🇵 Keita (Male)": "ja-JP-KeitaNeural"
 }
 
 SPEAKER_ALIASES = {
     "thiha": "my-MM-ThihaNeural",
     "nilar": "my-MM-NilarNeural",
+    "sonia": "en-GB-SoniaNeural",
+    "ryan": "en-GB-RyanNeural",
+    "xiaoxiao": "zh-CN-XiaoxiaoNeural",
+    "yunxi": "zh-CN-YunxiNeural",
+    "sunhi": "ko-KR-SunHiNeural",
+    "injoon": "ko-KR-InJoonNeural",
     "remy": "en-US-RemyMultilingualNeural",
     "andrew": "en-US-AndrewMultilingualNeural",
-    "brian": "en-US-BrianMultilingualNeural",
-    "emma": "en-US-EmmaMultilingualNeural",
-    "ava": "en-US-AvaMultilingualNeural",
-    "giuseppe": "it-IT-GiuseppeMultilingualNeural",
-    "vivienne": "fr-FR-VivienneMultilingualNeural",
-    "florian": "de-DE-FlorianMultilingualNeural",
-    "seraphina": "de-DE-SeraphinaMultilingualNeural",
     "nanami": "ja-JP-NanamiNeural",
-    "keita": "ja-JP-KeitaNeural",
-    "sunhi": "ko-KR-SunHiNeural"
+    "keita": "ja-JP-KeitaNeural"
 }
 
 SPEED_LIB = {
@@ -102,7 +104,8 @@ def get_user_state(user_id):
 def get_paths(user_id):
     return {
         "srt": f"downloads/{user_id}_subs.srt",
-        "dub_audio": f"downloads/{user_id}_dubbed.mp3"
+        "dub_audio": f"downloads/{user_id}_dubbed.mp3",
+        "media_in": f"downloads/{user_id}_media.file"
     }
 
 def clean_temp(user_id):
@@ -129,6 +132,13 @@ def parse_speaker(text, default_voice):
 def get_audio_hash(text, voice, rate):
     hash_str = f"{text}|{voice}|{rate}"
     return hashlib.md5(hash_str.encode()).hexdigest()
+
+def format_srt_time(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
 # --- 🔊 AUDIO POST-PROCESSING ---
 def trim_silence(audio_segment, silence_thresh=-40.0, chunk_size=5):
@@ -287,13 +297,12 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
                 except Exception: pass
 
         # --- PHASE 1 ---
-        semaphore = asyncio.Semaphore(5)
+        semaphore = asyncio.Semaphore(15) # Increased for extreme speed
         phase_text = "Analyzing Lines" if analyze_only else "Phase 1/2 (Measuring)"
         p1_tasks = [measure_base_chunk(c, user_id, base_rate_str, semaphore, lambda: update_progress(phase_text)) for c in chunks_data]
         p1_results_list = await asyncio.gather(*p1_tasks)
         base_results = {res["index"]: res for res in p1_results_list if res is not None}
 
-        # CALCULATE MATH & CATEGORIZE BOTTLENECKS
         max_ratio_needed = 1.0
         bottleneck_categories = {}
 
@@ -310,8 +319,7 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
                 
                 if min_possible_len > gap:
                     ratio = min_possible_len / gap
-                    if ratio > max_ratio_needed:
-                        max_ratio_needed = ratio
+                    if ratio > max_ratio_needed: max_ratio_needed = ratio
                         
                     line_speed = math.floor((1.0 / ratio) * 10) / 10.0
                     if line_speed < 0.6: line_speed = 0.6
@@ -333,13 +341,10 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
         friendly_voice_name = next((k for k, v in VOICE_LIB.items() if v == global_voice), global_voice)
 
         if analyze_only:
-            report = f"📊 **ANALYSIS REPORT**\n\n"
-            report += f"⚡ **Global Video Speed Needed:** `{final_speed_reported}`\n\n"
-            
+            report = f"📊 **ANALYSIS REPORT**\n\n⚡ **Global Video Speed Needed:** `{final_speed_reported}`\n\n"
             if bottleneck_categories:
                 critical_found = False
                 critical_report = ""
-                # Only process lines that need 0.7x or 0.6x
                 for speed_cat in sorted(bottleneck_categories.keys(), reverse=True):
                     if speed_cat <= 0.7:
                         critical_found = True
@@ -349,14 +354,13 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
                         critical_report += f"• Needs `{speed_cat}x`: Lines {b_str}\n"
                 
                 if critical_found:
-                    report += f"⚠️ **Critical Bottlenecks (0.7x & 0.6x):**\n" + critical_report
-                    report += f"\n💡 *Tip: Fix these specific lines to get the speed back to 0.8x or higher!*\n\n"
+                    report += f"⚠️ **Critical Bottlenecks (0.7x & 0.6x):**\n{critical_report}\n💡 *Tip: Fix these specific lines!*\n\n"
                 else:
-                    report += f"✅ **Acceptable Fit!** The required speed is `{final_speed_reported}`. No critical bottlenecks (< 0.8x) found.\n\n"
+                    report += f"✅ **Acceptable Fit!** Required speed is `{final_speed_reported}`.\n\n"
             else:
                 report += f"✅ **Perfect Fit!** All lines fit naturally inside the gaps.\n\n"
                 
-            report += "*(Settings cached. Click 'Generate' to create audio instantly!)*"
+            report += "*(Click 'Generate' to create audio instantly!)*"
             return True, None, report, friendly_voice_name
 
         # --- PHASE 2 ---
@@ -372,13 +376,11 @@ async def process_engine(user_id, srt_path, output_path, state, status_msg, anal
         
         caption = f"✅ **Dubbed successfully!**\n🗣️ Global Voice: {friendly_voice_name}\n⚡ **Speed Applied: {final_speed_reported}**"
         
-        # Only complain in caption if there are critical lines <= 0.7
         if bottleneck_categories and target_speed == "auto":
             worst_speed = min(bottleneck_categories.keys())
             if worst_speed <= 0.7:
                 worst_lines = bottleneck_categories[worst_speed]
-                b_str = ", ".join(worst_lines[:6])
-                if len(worst_lines) > 6: b_str += "..."
+                b_str = ", ".join(worst_lines[:6]) + ("..." if len(worst_lines) > 6 else "")
                 caption += f"\n⚠️ Pulled down to {worst_speed}x by lines: {b_str}"
             
         return True, None, caption, friendly_voice_name
@@ -410,12 +412,17 @@ def get_action_keyboard():
         [InlineKeyboardButton("🎬 Generate Dub Audio", callback_data="trigger_dub")]
     ])
 
+def get_transcribe_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎙️ Transcribe to SRT", callback_data="trigger_transcribe")]
+    ])
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     await update.message.reply_text(
         "⚙️ **STUDIO SETTINGS**\nConfigure your AI narrator and speed limits below.\n\n"
-        "*(Send me an `.srt` file or paste SRT text when you're ready!)*", 
+        "*(Send me an `.srt` file, paste text, or send Audio/Video to Auto-Transcribe!)*", 
         reply_markup=get_settings_keyboard(state)
     )
 
@@ -465,6 +472,33 @@ async def perform_action(update, context, analyze_only):
     else:
         await status_msg.edit_text(f"❌ Failed: {error}")
 
+async def run_whisper_transcription(update, context):
+    user_id = update.effective_user.id
+    p = get_paths(user_id)
+    msg = update.callback_query.message
+    
+    if not os.path.exists(p['media_in']):
+        await msg.edit_text("❌ Media file lost. Please upload again.")
+        return
+
+    status_msg = await msg.edit_text("🎙️ **Transcribing Audio with Whisper AI...**\n*(This cuts perfectly on each sentence)*")
+    
+    try:
+        # Run Whisper inference in a background thread to prevent blocking
+        def transcribe_task():
+            segments, _ = whisper_model.transcribe(p['media_in'], beam_size=5)
+            with open(p['srt'], "w", encoding="utf-8") as f:
+                for i, segment in enumerate(segments, start=1):
+                    start_str = format_srt_time(segment.start)
+                    end_str = format_srt_time(segment.end)
+                    f.write(f"{i}\n{start_str} --> {end_str}\n{segment.text.strip()}\n\n")
+                    
+        await asyncio.to_thread(transcribe_task)
+        await status_msg.edit_text("✅ **Transcription Complete!**\nSRT file generated successfully.\n\n*(Choose your next action below)*", reply_markup=get_action_keyboard())
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Transcription failed: {e}")
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -479,6 +513,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_fit": await fit_command(update, context)
     elif data == "trigger_analyze": await perform_action(update, context, analyze_only=True)
     elif data == "trigger_dub": await perform_action(update, context, analyze_only=False)
+    elif data == "trigger_transcribe": await run_whisper_transcription(update, context)
     
     elif data.startswith("set_"):
         if data.startswith("set_voice_"): state['dub_voice'] = data.replace("set_voice_", "")
@@ -519,7 +554,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(subs) > 0:
                 end = subs[-1].end
                 time_str = f"{end.hours:02d}:{end.minutes:02d}:{end.seconds:02d},{end.milliseconds:03d}"
-                reply_text = f"✅ **SRT Text Validated!** (Old Cache Cleared)\n📊 **Total:** {len(subs)} Blocks\n⏱️ **End Time:** {time_str}\n\n*(Paste more or choose an action)*"
+                reply_text = f"✅ **SRT Text Validated!**\n📊 **Total:** {len(subs)} Blocks\n⏱️ **End Time:** {time_str}\n\n*(Paste more or choose an action)*"
             else:
                 reply_text = "⚠️ Text saved, but no blocks detected."
         except Exception as e:
@@ -527,18 +562,34 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await msg.reply_text(reply_text, reply_markup=get_action_keyboard())
     else:
-        await msg.reply_text("ℹ️ Please send an `.srt` file or paste valid SRT text.")
+        await msg.reply_text("ℹ️ Please send an `.srt` file, raw text, or an audio/video file.")
 
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def media_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
     p = get_paths(user_id)
-    if msg.document.file_name.lower().endswith('.srt'):
+    
+    # Check if document is SRT
+    if msg.document and msg.document.file_name.lower().endswith('.srt'):
         clean_temp(user_id)
         await (await msg.document.get_file()).download_to_drive(p['srt'])
         await msg.reply_text("✅ **SRT File Loaded.** (Old Cache Cleared)\nReady for action!", reply_markup=get_action_keyboard())
+        return
+
+    # Handle Audio / Video for Whisper Transcription
+    file_obj = None
+    if msg.audio: file_obj = msg.audio
+    elif msg.voice: file_obj = msg.voice
+    elif msg.video: file_obj = msg.video
+    elif msg.document and msg.document.mime_type and ("audio" in msg.document.mime_type or "video" in msg.document.mime_type):
+        file_obj = msg.document
+
+    if file_obj:
+        status = await msg.reply_text("⬇️ Downloading media...")
+        await (await file_obj.get_file()).download_to_drive(p['media_in'])
+        await status.edit_text("✅ **Media Downloaded!**\nWould you like to transcribe this to SRT format?", reply_markup=get_transcribe_keyboard())
     else:
-        await msg.reply_text("❌ Please send an `.srt` file.")
+        await msg.reply_text("❌ Unsupported file format.")
 
 async def health_check(request): return web.Response(text="Bot running!", status=200)
 
@@ -556,17 +607,14 @@ async def main():
     bot_app.add_handler(CommandHandler("clearall", clearall_command))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
-    bot_app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+    bot_app.add_handler(MessageHandler(filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO, media_file_handler))
     
-    # ၁။ Bot ကို Manual စတင်ခြင်း (Web Server နဲ့ တွဲသုံးဖို့ အမှန်ကန်ဆုံးနည်းလမ်း)
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
     
-    # ၂။ Render အတွက် Web Server ကို နောက်ကွယ်မှာ ပြိုင်တူ Run ခြင်း
     asyncio.create_task(run_server())
     
-    # ၃။ Bot ရော Web Server ရော မပိတ်သွားစေရန် Event Loop ကို အမြဲဖွင့်ထားခြင်း
     await asyncio.Event().wait()
 
 if __name__ == '__main__': 
