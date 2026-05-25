@@ -3,3 +3,4 @@ pydub
 pysrt
 edge-tts
 aiohttp
+faster-whisper
